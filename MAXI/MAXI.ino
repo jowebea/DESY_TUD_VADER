@@ -289,6 +289,7 @@ int read_PT100_m50_100(int PIN){
     // Derzeit nur roher ADC-Wert
     return analogRead(PIN);
 }
+inline float mapPT100(int adc) { return (adc) *0.44-50; }   // °C
 
 int read_px1(int PIN){
     // Beispiel: druck 0..10 bar -> 0..1.000.000 Pa
@@ -336,14 +337,22 @@ void send_status(){
 
     Serial.println("----- sensors -----");
     Serial.print("leak_sensor:   "); Serial.println(analogRead(LEAK_SENSOR));
-    Serial.print("pt100_storage: "); Serial.println(read_PT100_m50_100(PT100_STORAGE));
-    Serial.print("pt100_vacuum:  ");  Serial.println(read_PT100_m50_100(PT100_VACUUM));
-    Serial.print("pt100_housing: "); Serial.println(read_PT100_m50_100(PT100_HOUSING));
+    
+    int pt100_storage_raw = read_PT100_m50_100(PT100_STORAGE);
+    int pt100_vacuum_raw = read_PT100_m50_100(PT100_VACUUM);
+    int pt100_housing_raw = read_PT100_m50_100(PT100_HOUSING);
+    Serial.print("pt100_storage: "); Serial.print(mapPT100(pt100_storage_raw), 2);
+      Serial.print(" °C ("); Serial.print(pt100_storage_raw); Serial.println(")");
+    Serial.print("pt100_vacuum: "); Serial.print(mapPT100(pt100_vacuum_raw), 2);
+      Serial.print(" °C ("); Serial.print(pt100_storage_raw); Serial.println(")");
+    Serial.print("pt100_housing: "); Serial.print(mapPT100(pt100_housing_raw), 2);
+      Serial.print(" °C ("); Serial.print(pt100_storage_raw); Serial.println(")");
+    
     int p11_raw = read_px1(P11);
-    Serial.print("p11: "); Serial.print(mapPx1(p11_raw));
+    Serial.print("p11: "); Serial.print(mapPx1(p11_raw), 2);
       Serial.print(" kPa ("); Serial.print(p11_raw); Serial.println(")");
     int p31_raw = read_px1(P31);
-    Serial.print("p31: "); Serial.print(mapPx1(p31_raw));
+    Serial.print("p31: "); Serial.print(mapPx1(p31_raw), 2);
       Serial.print(" kPa ("); Serial.print(p31_raw); Serial.println(")");
 
     Serial.println("------- MFCs -------");
