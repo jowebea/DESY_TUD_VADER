@@ -42,10 +42,8 @@ bool  ERROR = false;
 float target_p      = 0;          // Sollwert [kPa]
 int   max_pwm_step  = 1;          // Rampe 1…255
 
-
 bool P20_online = false;
 unsigned long last_control_time_us = 0; // in Mikrosekunden
-
 
 RunningMedian _p21(5), _p20(5);
 static int pwmVP1 = 0, pwmVP2 = 0;
@@ -64,8 +62,6 @@ int accurateADC_P21(){ for(byte i=0;i<5;i++) _p21.add(analogRead(P21));
                        return _p21.getMedian(); }
 int accurateADC_P20(){ for(byte i=0;i<5;i++) _p20.add(analogRead(P20));
                        return _p20.getMedian(); }
-
-
 
 /* --------------------------- Schutzventil VS2 ----------------------------- *
    Debounce vollständig entfernt – nur Hysterese 191↘170 kPa bleibt.         */
@@ -93,7 +89,8 @@ float readPressure() {
 
 /* --------------------------- Druckregelung -------------------------------- */
 // Reglerparameter
-const float Kp = 2.0;
+const float Kp_increase = 0.0;
+const float Kp_decrease = 0.0;
 const float KI_per_100ms = 1.0;            // Integralzuwachs bei 100 ms
 const int OFFSET_INCREASE = 98;            // Basis für Druck erhöhen
 const int OFFSET_DECREASE = 116;           // Basis für Druck reduzieren
@@ -132,7 +129,7 @@ void control_pressure() {
     // Istwert zu niedrig -> Druck erhöhen aktivieren
     integral_decrease = 0; // anderer Regler resetten
 
-    float P = Kp * error;
+    float P = Kp_increase * error;
     // Integral auf Basis vergangener Zeit
     integral_increase += error * integral_factor;
     float I = integral_increase;
@@ -151,7 +148,7 @@ void control_pressure() {
     integral_increase = 0;
 
     float error_pos = -error; // positiv machen
-    float P = Kp * error_pos;
+    float P = Kp_decrease * error_pos;
     integral_decrease += error_pos * integral_factor;
     float I = integral_decrease;
 
@@ -183,7 +180,10 @@ control_message read_serial_command()
 void send_status()
 {
     Serial.println("---");
-    Serial.print("P (kPa): ");       Serial.println(mapP21(accurateADC_P21()));
+    Serial.print("P21 (kPa): ");       Serial.print(mapP21(accurateADC_P21()));
+      Serial.print(" (");Serial.print(accurateADC_P21());Serial.println(")");
+    Serial.print("P20 (kPa): ");       Serial.print(mapP20(accurateADC_P20()));    
+      Serial.print(" (");Serial.print(accurateADC_P20());Serial.println(")");
     Serial.print("VS2: ");           Serial.println(vs2State==CLOSE?"CLOSE":"OPEN");
     Serial.print("Setpoint: ");      Serial.println(target_p);
     Serial.print("PWM1: ");          Serial.println(pwmVP1);
@@ -218,5 +218,5 @@ void loop()
     if      (cm.command == SEND_STATUS) send_status();
     else if (cm.command == SET)         set(cm.address, cm.value);
 
-    for (int i=0;i<200;i++){ protect_sensors(); control_pressure(); }
+    for (int i=0;i<50;i++){ protect_sensors(); control_pressure(); }
 }
