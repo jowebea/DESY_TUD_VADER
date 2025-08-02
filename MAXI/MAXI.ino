@@ -1,5 +1,6 @@
 #include <Controllino.h>
 #include "ModbusRtu.h"
+#include <RunningMedian.h>
 
 // Modbus Master-Objekt (Adresse=0, UART=RS485Serial=3, DE/RE-Pin=0)
 #define MasterModbusAdd  0
@@ -100,6 +101,12 @@ unsigned short command;
 #define ADDRESS_MFC_N2_TOTAL  41
 
 bool ERROR = false;
+RunningMedian _p11(5), _p31(5);
+
+int accurateADC_P11(){ for(byte i=0;i<5;i++) _p11.add(analogRead(P11));
+                       return _p11.getMedian(); }
+int accurateADC_P31(){ for(byte i=0;i<5;i++) _p31.add(analogRead(P31));
+                       return _p31.getMedian(); }
 
 // ---------------------------------------------------------
 // Hilfsfunktionen zum Lesen/Schreiben eines Float-Wertes
@@ -296,7 +303,7 @@ int read_px1(int PIN){
     // => Hier nur roher ADC-Wert
     return analogRead(PIN);
 }
-inline float mapPx1(int adc) { return (adc) / 0.21527; }   // kPa
+inline float mapPx1(int adc) { return (adc) / 0.130172; }   // kPa
 
 int read_px0(int PIN){
     // Beispiel: druck -1..+1 bar -> ...
@@ -348,10 +355,10 @@ void send_status(){
     Serial.print("pt100_housing: "); Serial.print(mapPT100(pt100_housing_raw), 2);
       Serial.print(" °C ("); Serial.print(pt100_storage_raw); Serial.println(")");
     
-    int p11_raw = read_px1(P11);
+    int p11_raw = accurateADC_P11();
     Serial.print("p11: "); Serial.print(mapPx1(p11_raw), 2);
       Serial.print(" kPa ("); Serial.print(p11_raw); Serial.println(")");
-    int p31_raw = read_px1(P31);
+    int p31_raw = accurateADC_P31();
     Serial.print("p31: "); Serial.print(mapPx1(p31_raw), 2);
       Serial.print(" kPa ("); Serial.print(p31_raw); Serial.println(")");
 
@@ -581,4 +588,3 @@ void loop()
         break;
     }
 }
-
