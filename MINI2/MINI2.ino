@@ -34,12 +34,18 @@ struct control_message { int command, address, value; } cm;
 #define CLOSE 0
 #define OPEN  1
 #define PWM_MAX_CMD     225
-#define PWM_MIN_OFFSET   30
+#define PWM_MIN_OFFSET_VP1   116
+#define PWM_MIN_OFFSET_VP2   98
 
 /* --------------------------- Globale Variablen ---------------------------- */
 bool  ERROR = false;
 float target_p      = 0;          // Sollwert [kPa]
 int   max_pwm_step  = 1;          // Rampe 1…255
+
+
+bool P20_online = false;
+unsigned long last_control_time_us = 0; // in Mikrosekunden
+
 
 RunningMedian _p21(5), _p20(5);
 static int pwmVP1 = 0, pwmVP2 = 0;
@@ -59,59 +65,107 @@ int accurateADC_P21(){ for(byte i=0;i<5;i++) _p21.add(analogRead(P21));
 int accurateADC_P20(){ for(byte i=0;i<5;i++) _p20.add(analogRead(P20));
                        return _p20.getMedian(); }
 
+
+
 /* --------------------------- Schutzventil VS2 ----------------------------- *
    Debounce vollständig entfernt – nur Hysterese 191↘170 kPa bleibt.         */
 void protect_sensors()
 {
     float p21 = mapP21(fastADC_P21());
 
-    if (p21 > 191.0 && vs2State == OPEN) {
+    if (p21 > 191.0) {
         digitalWrite(VS2_PIN, CLOSE);
         vs2State = CLOSE;
+        P20_online = false;
     }
-    else if (p21 < 170.0 && vs2State == CLOSE) {
+    else if (p21 < 170.0) {
         digitalWrite(VS2_PIN, OPEN);
         vs2State = OPEN;
+        P20_online = true;
     }
 }
 
-/* --------------------------- Rampen-Begrenzer ----------------------------- */
-inline int ramp(int cur,int tgt,int step){
-    if (cur < tgt) return min(cur+step, tgt);
-    if (cur > tgt) return max(cur-step, tgt);
-    return cur;
+float readPressure() {
+    return (P20_online) 
+            ? mapP20(accurateADC_P20())
+            : mapP21(accurateADC_P21());
 }
 
 /* --------------------------- Druckregelung -------------------------------- */
-void control_pressure()
-{
-    /* 1 — effektiver Sollwert bestimmen */
-    float effSet = (target_p < LOW_PRESSURE_LIMIT && vs2State == CLOSE)
-                   ? LOW_PRESSURE_LIMIT : target_p;
+// Reglerparameter
+const float Kp = 2.0;
+const float KI_per_100ms = 1.0;            // Integralzuwachs bei 100 ms
+const int OFFSET_INCREASE = 98;            // Basis für Druck erhöhen
+const int OFFSET_DECREASE = 116;           // Basis für Druck reduzieren
+const int TOLERANCE = 2;                   // Sollwert-Toleranz (in denselben Einheiten wie Druck)
 
-    /* 2 — aktuellen Druck messen */
-    float p = (effSet < LOW_PRESSURE_LIMIT)
-              ? mapP20(accurateADC_P20())
-              : mapP21(accurateADC_P21());
+// Interne Zustände
+float integral_increase = 0;
+float integral_decrease = 0;
 
-    /* 3 — Regler (proportional mit Totband) */
-    float err = effSet - p;
-    int cmd = constrain((int)(1.5 * fabs(err)), 0, PWM_MAX_CMD);
 
-    int tgtVP1 = 0, tgtVP2 = 0;
-    if (fabs(err) <= DEADBAND_KPA) {                    // Totband
-        tgtVP1 = tgtVP2 = 0;
-    } else if (err > 0) {                               // Druck zu niedrig
-        tgtVP1 = cmd;
-    } else {                                            // Druck zu hoch
-        tgtVP2 = cmd;
-    }
+void control_pressure() {
+  unsigned long now_us = micros();
+  float delta_ms = (now_us - last_control_time_us) / 1000.0; // in ms
+  if (delta_ms <= 0) return; // Schutz
+  last_control_time_us = now_us;
 
-    pwmVP1 = ramp(pwmVP1, tgtVP1, max_pwm_step);
-    pwmVP2 = ramp(pwmVP2, tgtVP2, max_pwm_step);
+  float pressure = readPressure();
+  float error = target_p - pressure;
 
-    analogWrite(VP1_PIN, pwmVP1 ? pwmVP1 + PWM_MIN_OFFSET : 0);
-    analogWrite(VP2_PIN, pwmVP2 ? pwmVP2 + PWM_MIN_OFFSET : 0);
+  // Sollwert erreicht?
+  if (abs(error) <= TOLERANCE) {
+    // Beide Regler zurücksetzen und Ausgänge null setzen
+    integral_increase = 0;
+    integral_decrease = 0;
+    analogWrite(VP1_PIN, 0);
+    pwmVP1 = 0;
+    analogWrite(VP2_PIN, 0);
+    pwmVP2 = 0;
+    return;
+  }
+
+  // Skalierungsfaktor für Integral: (delta_ms / 100ms) * KI_per_100ms
+  float integral_factor = (delta_ms / 100.0) * KI_per_100ms;
+
+  if (error > 0) {
+    // Istwert zu niedrig -> Druck erhöhen aktivieren
+    integral_decrease = 0; // anderer Regler resetten
+
+    float P = Kp * error;
+    // Integral auf Basis vergangener Zeit
+    integral_increase += error * integral_factor;
+    float I = integral_increase;
+
+    float control = P + I;
+    float raw_output = OFFSET_INCREASE + control;
+
+    int pwm = constrain((int)round(raw_output), 0, 255);
+    analogWrite(VP1_PIN, pwm);
+    pwmVP1 = pwm; 
+    analogWrite(VP2_PIN, 0);
+    pwmVP2 = 0;
+  } 
+  else {
+    // error < 0 -> Istwert zu hoch -> Druck reduzieren aktivieren
+    integral_increase = 0;
+
+    float error_pos = -error; // positiv machen
+    float P = Kp * error_pos;
+    integral_decrease += error_pos * integral_factor;
+    float I = integral_decrease;
+
+    float control = P + I;
+    float raw_output = OFFSET_DECREASE + control;
+
+    int pwm = constrain((int)round(raw_output), 0, 255);
+    analogWrite(VP1_PIN, 0);
+    pwmVP1 = 0;
+    analogWrite(VP2_PIN, pwm);
+    pwmVP2 = pwm;
+
+  }
+
 }
 
 /* --------------------------- Kommunikation -------------------------------- */
@@ -153,6 +207,7 @@ void setup()
 
     protect_sensors();         // initialer VS2-Status
     target_p = 0;              // Start-Sollwert
+    last_control_time_us = micros();
 }
 
 void loop()
