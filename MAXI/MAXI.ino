@@ -295,6 +295,7 @@ int read_px1(int PIN){
     // => Hier nur roher ADC-Wert
     return analogRead(PIN);
 }
+inline float mapPx1(int adc) { return (adc) / 0.21527; }   // kPa
 
 int read_px0(int PIN){
     // Beispiel: druck -1..+1 bar -> ...
@@ -338,26 +339,29 @@ void send_status(){
     Serial.print("pt100_storage: "); Serial.println(read_PT100_m50_100(PT100_STORAGE));
     Serial.print("pt100_vacuum:  ");  Serial.println(read_PT100_m50_100(PT100_VACUUM));
     Serial.print("pt100_housing: "); Serial.println(read_PT100_m50_100(PT100_HOUSING));
-    Serial.print("p11: "); Serial.println(read_px1(P11));
-    Serial.print("p30: "); Serial.println(read_px0(P30));
-    Serial.print("p31: "); Serial.println(read_px1(P31));
-    
+    int p11_raw = read_px1(P11);
+    Serial.print("p11: "); Serial.print(mapPx1(p11_raw));
+      Serial.print(" kPa ("); Serial.print(p11_raw); Serial.println(")");
+    int p31_raw = read_px1(P31);
+    Serial.print("p31: "); Serial.print(mapPx1(p31_raw));
+      Serial.print(" kPa ("); Serial.print(p31_raw); Serial.println(")");
+
     Serial.println("------- MFCs -------");
     Serial.println("Butan/Methan MFC");
     Serial.print("   unit:                  ");  Serial.println(read_mfc_unit_string(MFC_BUTAN));
-    Serial.print("   flow:                  ");  Serial.println(read_flow(MFC_BUTAN));
+    Serial.print("   flow Butan:            ");  Serial.println(read_flow(MFC_BUTAN));
     Serial.print("   flow (set point) [20]: ");  Serial.println(read_flow_setpoint(MFC_BUTAN));
     Serial.print("   temperature:           ");  Serial.println(read_gastemperature(MFC_BUTAN));
     Serial.print("   totalisator      [21]: ");  Serial.println(read_totalisator(MFC_BUTAN));
     Serial.println("CO2 MFC");
     Serial.print("   unit:                  ");  Serial.println(read_mfc_unit_string(MFC_CO2));
-    Serial.print("   flow:                  ");  Serial.println(read_flow(MFC_CO2));
+    Serial.print("   flow CO2:              ");  Serial.println(read_flow(MFC_CO2));
     Serial.print("   flow (set point) [30]: ");  Serial.println(read_flow_setpoint(MFC_CO2));
     Serial.print("   temperature:           ");  Serial.println(read_gastemperature(MFC_CO2));
     Serial.print("   totalisator      [31]: ");  Serial.println(read_totalisator(MFC_CO2));
     Serial.println("N2/Argon MFC");
     Serial.print("   unit:                  ");  Serial.println(read_mfc_unit_string(MFC_N2));
-    Serial.print("   flow:                  ");  Serial.println(read_flow(MFC_N2));
+    Serial.print("   flow N2:               ");  Serial.println(read_flow(MFC_N2));
     Serial.print("   flow (set point) [40]: ");  Serial.println(read_flow_setpoint(MFC_N2));
     Serial.print("   temperature:           ");  Serial.println(read_gastemperature(MFC_N2));
     Serial.print("   totalisator      [41]: ");  Serial.println(read_totalisator(MFC_N2));
