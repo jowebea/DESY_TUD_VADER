@@ -221,6 +221,7 @@ class MAXI:
     - Status:  "1; 0; 0"
     - Setzen:  "2; <address>; <value>"
     """
+
     _IO_MAP = {
         1: ("v1_power", "switch"),
         2: ("v2_power", "switch"),
@@ -244,7 +245,12 @@ class MAXI:
         self._lock = threading.Lock()
         self._last_status_ts = 0.0
         self._running = True
+        self._current_mfc: Optional[str] = None  # aktueller Block
         threading.Thread(target=self._reader_loop, daemon=True).start()
+
+        # >>> Neu: direkt Status anfordern & kurz warten
+        self.request_status()
+        self.wait_for_fresh_status(timeout=0.5)
 
     # --- Senden ---
     def _send(self, cmd: int, address: int, value: Union[int, float]) -> None:
@@ -275,7 +281,6 @@ class MAXI:
     def set_totalisator_co2(self,   value_lpm: float = 0.0) -> None: self._send(2, 31, self._to_cLpm(value_lpm))
     def set_totalisator_n2(self,    value_lpm: float = 0.0) -> None: self._send(2, 41, self._to_cLpm(value_lpm))
 
-    # Reset-Aliase (wurden im High-level aufgerufen)
     def reset_totalisator_butan(self) -> None: self.set_totalisator_butan(0.0)
     def reset_totalisator_co2(self)   -> None: self.set_totalisator_co2(0.0)
     def reset_totalisator_n2(self)    -> None: self.set_totalisator_n2(0.0)
@@ -306,12 +311,35 @@ class MAXI:
             self.status.setdefault(name, {})
             self._touch()
 
+    def _set_current_mfc(self, key: Optional[str]) -> None:
+        with self._lock:
+            self._current_mfc = key
+            self._touch()
+
+    def _get_current_mfc(self) -> Optional[str]:
+        with self._lock:
+            return self._current_mfc
+
     def _parse_status_line(self, line: str) -> None:
         low = line.lower().strip()
 
-        if "butan/methan mfc" in low: self._ensure_mfc("mfc_butan"); return
-        if "co2 mfc"         in low: self._ensure_mfc("mfc_co2");   return
-        if "n2/argon mfc"    in low: self._ensure_mfc("mfc_n2");    return
+        # Abschnittsüberschriften der MFCs
+        if "butan/methan mfc" in low:
+            self._ensure_mfc("mfc_butan")
+            self._set_current_mfc("mfc_butan")
+            return
+        if "co2 mfc" in low:
+            self._ensure_mfc("mfc_co2")
+            self._set_current_mfc("mfc_co2")
+            return
+        if "n2/argon mfc" in low:
+            self._ensure_mfc("mfc_n2")
+            self._set_current_mfc("mfc_n2")
+            return
+
+        # Abschnittsende optional zurücksetzen
+        if low.startswith("------- mfcs -------") or low.startswith("---"):
+            self._set_current_mfc(None)
 
         m_id = re.search(r"\[([0-9]{1,3})\]\s*:\s*([+-]?\d+(?:\.\d+)?)", line)
         if m_id:
@@ -342,7 +370,7 @@ class MAXI:
         m_unit = re.search(r"^\s*unit:\s*(.+)$", low)
         if m_unit:
             unit = m_unit.group(1).strip()
-            target = self._last_mfc_key()
+            target = self._get_current_mfc()
             if target: self._set_nested(f"{target}.unit", unit)
             return
 
@@ -355,15 +383,9 @@ class MAXI:
 
         m_temp = re.search(r"^\s*temperature\s*:\s*([+-]?\d+(?:\.\d+)?)", low)
         if m_temp:
-            target = self._last_mfc_key()
+            target = self._get_current_mfc()
             if target: self._set_nested(f"{target}.temperature", float(m_temp.group(1)))
             return
-
-    def _last_mfc_key(self) -> Optional[str]:
-        with self._lock:
-            for k in ("mfc_n2", "mfc_co2", "mfc_butan"):
-                if k in self.status: return k
-        return None
 
     def wait_for_fresh_status(self, timeout: float = 1.0) -> bool:
         before = self._last_status_ts
@@ -371,7 +393,8 @@ class MAXI:
         end = time.time() + timeout
         while time.time() < end:
             with self._lock:
-                if self._last_status_ts > before: return True
+                if self._last_status_ts > before:
+                    return True
             time.sleep(0.01)
         return False
 
@@ -383,6 +406,7 @@ class MAXI:
         self._running = False
         time.sleep(0.05)
         self.dev.close()
+
 
 # ====================== High-level Driver ======================
 class VaderDeviceDriver:
@@ -402,7 +426,7 @@ class VaderDeviceDriver:
         self.maxi.set_valve(ADDRESS_V1, True)
         self.maxi.set_valve(ADDRESS_V2, True)
         self.maxi.set_valve(ADDRESS_V3, True)
-        self.mini2.set_target_pressure(-100)
+        self.mini2.set_target_pressure(0)
         self.maxi.activate_v4(True)
 
         start = time.time()
@@ -431,12 +455,15 @@ class VaderDeviceDriver:
         self.maxi.activate_v4(enable)
 
     def get_all_status(self, mini1_last_n: Optional[int] = 100) -> Dict[str, Any]:
-        self.mini2.request_status(); self.maxi.request_status()
-        time.sleep(0.05)
+        # aktiv Status triggern + auf frische Daten warten
+        self.mini2.request_status()
+        self.maxi.request_status()
+        self.mini2._wait_for_recent_status(0.5)    
+        self.maxi.wait_for_fresh_status(timeout=30) 
+
         return {
             "mini1": {
-                "p20": self.mini1.p20, "p21": self.mini1.p21,
-                "latest_combined_pressure": self.mini1.pressure,
+                "latest_pressure": self.mini1.pressure,
                 "recent_series": self.mini1.get_last_n(mini1_last_n),
             },
             "mini2": self.mini2.get_status(),
@@ -466,29 +493,41 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print("init Driver...")
     driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
+    time.sleep(30)
+    driver.get_all_status()
+
+    print("deactivating Fans...")
+    driver.maxi.set_valve(ADDRESS_FAN_IN, 0)
+    driver.maxi.set_valve(ADDRESS_FAN_OUT, 0)
+    time.sleep(10)
+    print("activating Fans...")
+    driver.maxi.set_valve(ADDRESS_FAN_IN, 1)
+    driver.maxi.set_valve(ADDRESS_FAN_OUT, 1)
+
+
     try:
         print("Opening Storage Volume...")
         driver.storage_volume(open_=False)
         time.sleep(0.5)
-        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Status:", driver.get_all_status(mini1_last_n=2))
         print("Using defined Gas...")
         driver.use_gas(n2=30, co2=20, butan=10)
         time.sleep(0.5)
-        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Status:", driver.get_all_status(mini1_last_n=2))
         print("setting Pressure to 100kPa...")
         driver.setpoint_pressure(100)
         time.sleep(0.5)
-        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Status:", driver.get_all_status(mini1_last_n=2))
         
         print("setting Pressure to 0kPa...")
         driver.activate_vac(True)
         driver.setpoint_pressure(0)
         time.sleep(5)
-        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Status:", driver.get_all_status(mini1_last_n=2))
         
         print("evacuate all...")
         driver.vac_all(vacuum_pressure_kpa=2.0)
-        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Status:", driver.get_all_status(mini1_last_n=2))
         driver.reset_all_totalisators()
     finally:
         driver.close()
