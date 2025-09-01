@@ -67,18 +67,10 @@ class MINI1:
         while self._running:
             line = self.dev.readline()
             if not line:
-                time.sleep(0.01)
+                time.sleep(0.0001)
                 continue
-            parts = line.split(",")
-            if len(parts) < 2:
-                continue
-            try:
-                p20_val, p21_val = float(parts[0]), float(parts[1])
-            except ValueError:
-                continue
-            pressure = self._compute_pressure(p20_val, p21_val)
+            pressure = float(line)
             with self._lock:
-                self.p20, self.p21 = p20_val, p21_val
                 self._series.append((datetime.now(timezone.utc), pressure))
 
     def get_last_n(self, n: Optional[int] = None) -> List[Tuple[datetime, float]]:
@@ -410,10 +402,8 @@ class VaderDeviceDriver:
         self.maxi.set_valve(ADDRESS_V1, True)
         self.maxi.set_valve(ADDRESS_V2, True)
         self.maxi.set_valve(ADDRESS_V3, True)
-        # MINI2 manuell voll auf
-        self.mini2.set_state_manual()
-        self.mini2.set_manual_vp1(255); self.mini2.set_manual_vp2(255)
-        time.sleep(2); self.maxi.activate_v4(True)
+        self.mini2.set_target_pressure(-100)
+        self.maxi.activate_v4(True)
 
         start = time.time()
         while True:
@@ -427,6 +417,8 @@ class VaderDeviceDriver:
         self.maxi.set_valve(ADDRESS_V2, False)
         self.maxi.set_valve(ADDRESS_V3, False)
         self.mini2.set_manual_vp1(0); self.mini2.set_manual_vp2(0); self.mini2.set_state_auto()
+        self.mini2.set_target_pressure(0)
+        
 
     def use_gas(self, n2: float, co2: float, butan: float) -> None:
         # Eingaben 0..100 -> l/min = value/10
@@ -464,18 +456,37 @@ class VaderDeviceDriver:
 
 # === Beispiel ===
 if __name__ == "__main__":
+    print("testing VaderDeviceDriver...")
+    print("assigning Ports...")
     # macOS: ersetze durch deine Ports (siehe ls /dev/cu.*)
     MINI1_PORT = "/dev/cu.usbmodem1133101"
     MINI2_PORT = "/dev/cu.usbmodem1133301"
     MAXI_PORT  = "/dev/cu.usbmodem1133201"
 
     logging.basicConfig(level=logging.INFO)
+    print("init Driver...")
     driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
     try:
-        driver.storage_volume(open_=True)
+        print("Opening Storage Volume...")
+        driver.storage_volume(open_=False)
+        time.sleep(0.5)
+        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("Using defined Gas...")
         driver.use_gas(n2=30, co2=20, butan=10)
+        time.sleep(0.5)
+        print("Status:", driver.get_all_status(mini1_last_n=10))
+        print("setting Pressure to 100kPa...")
         driver.setpoint_pressure(100)
+        time.sleep(0.5)
+        print("Status:", driver.get_all_status(mini1_last_n=10))
+        
+        print("setting Pressure to 0kPa...")
         driver.activate_vac(True)
+        driver.setpoint_pressure(0)
+        time.sleep(5)
+        print("Status:", driver.get_all_status(mini1_last_n=10))
+        
+        print("evacuate all...")
         driver.vac_all(vacuum_pressure_kpa=2.0)
         print("Status:", driver.get_all_status(mini1_last_n=10))
         driver.reset_all_totalisators()
