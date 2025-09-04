@@ -9,7 +9,7 @@ MINI1_PORT = "/dev/ttyACM0"
 MINI2_PORT = "/dev/ttyACM2"
 MAXI_PORT  = "/dev/ttyACM1"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 print("init Driver...")
 driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
 time.sleep(5)
