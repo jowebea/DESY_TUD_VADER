@@ -534,7 +534,7 @@ class VaderDeviceDriver:
 
     def use_gas(self, n2: int, co2: int, butan: int) -> None:
         # Eingaben 0..10 -> l/min 
-        self.maxi.set_flow_n2(n2); self.maxi.set_flow_co2(co2); self.maxi.set_flow_butan(butan)
+        self.maxi.set_flow_n2(flow=n2); self.maxi.set_flow_co2(flow=co2); self.maxi.set_flow_butan(flow=butan)
 
     def setpoint_pressure(self, kpa: Union[int, float]) -> None:
         self.mini2.set_target_pressure(kpa)
