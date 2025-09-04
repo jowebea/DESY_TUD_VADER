@@ -1,6 +1,6 @@
 import logging
 import time
-import VaderDeviceDriver
+from VaderDeviceDriver import VaderDeviceDriver
 
 print("testing VaderDeviceDriver...")
 print("assigning Ports...")
