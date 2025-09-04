@@ -10,27 +10,22 @@ MINI2_PORT = "/dev/ttyACM2"
 MAXI_PORT  = "/dev/ttyACM1"
 
 logging.basicConfig(level=logging.DEBUG)
-print("##########################")
-print("#### init Driver... ######")
-print("##########################")
+print("init Driver...")
 driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
 time.sleep(10)
-try:
-    driver.get_all_status()
-    print("##########################")
-    print("Setting N2 to 5nl/min...")
-    print("##########################")
-    driver.use_gas(n2=5, co2=0, butan=0)
-    time.sleep(0.2)
-     
-    print("##########################")
-    print("Closing V4 (to let it cool)...")
-    print("##########################")
-    driver.maxi.activate_v4(False)
-    time.sleep(0.2)
-
-    print("Status:", driver.get_all_status(mini1_last_n=2))
-    time.sleep(0.2)
-
-finally:
-    driver.close()
+print("Setting CO2 to 10 nl/min...")
+driver.maxi._send_only(2; 30; 10)
+time.sleep(2)
+print("Setting N2 to 0 nl/min...")
+driver.maxi._send_only(2; 20; 0)
+time.sleep(2)
+print("Setting Butan to 0 nl/min...")
+driver.maxi._send_only(2; 40; 0)
+time.sleep(2)
+for i in range(100):
+    print("applying pressure...")
+    driver.mini2._send_only(2; 3; 500)
+    time.sleep(2)
+    print("applying Vacuum...")
+    driver.mini2._send_only(2; 3; 0)
+    time.sleep(8)
