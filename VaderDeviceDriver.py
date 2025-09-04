@@ -348,26 +348,23 @@ class MAXI:
 
     # --- MFC ---
     @staticmethod
-    def _to_cLpm(flow_lpm: float) -> int:
-        return int(round(flow_lpm * 100.0))
+    def set_flow_butan(self, flow: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 20, flow, timeout=timeout)
 
-    def set_flow_butan(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 20, self._to_cLpm(flow_lpm), timeout=timeout)
+    def set_flow_co2(self, flow: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 30, flow, timeout=timeout)
 
-    def set_flow_co2(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 30, self._to_cLpm(flow_lpm), timeout=timeout)
+    def set_flow_n2(self, flow: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 40, flow, timeout=timeout)
 
-    def set_flow_n2(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 40, self._to_cLpm(flow_lpm), timeout=timeout)
+    def set_totalisator_butan(self, value: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 21, value, timeout=timeout)
 
-    def set_totalisator_butan(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 21, self._to_cLpm(value_lpm), timeout=timeout)
+    def set_totalisator_co2(self, value: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 31, value, timeout=timeout)
 
-    def set_totalisator_co2(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 31, self._to_cLpm(value_lpm), timeout=timeout)
-
-    def set_totalisator_n2(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
-        return self._send_and_wait_status(2, 41, self._to_cLpm(value_lpm), timeout=timeout)
+    def set_totalisator_n2(self, value: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 41, value, timeout=timeout)
 
     def reset_totalisator_butan(self, timeout: Optional[float] = None) -> bool:
         return self.set_totalisator_butan(0.0, timeout=timeout)
