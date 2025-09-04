@@ -403,6 +403,74 @@ class MAXI:
         self._running = False
         time.sleep(0.05)
         self.dev.close()
+    
+    def _parse_status_line(self, line: str) -> None:
+        low = line.lower().strip()
+
+        # Abschnittsüberschriften der MFCs
+        if "butan/methan mfc" in low:
+            self._ensure_mfc("mfc_butan")
+            self._set_current_mfc("mfc_butan")
+            return
+        if "co2 mfc" in low:
+            self._ensure_mfc("mfc_co2")
+            self._set_current_mfc("mfc_co2")
+            return
+        if "n2/argon mfc" in low:
+            self._ensure_mfc("mfc_n2")
+            self._set_current_mfc("mfc_n2")
+            return
+
+        # Abschnittsende optional zurücksetzen
+        if low.startswith("------- mfcs -------") or low.startswith("---"):
+            self._set_current_mfc(None)
+
+        m_id = re.search(r"\[([0-9]{1,3})\]\s*:\s*([+-]?\d+(?:\.\d+)?)", line)
+        if m_id:
+            id_num, val_str = int(m_id.group(1)), m_id.group(2)
+            try: val_num = float(val_str)
+            except ValueError: val_num = val_str
+            if id_num in self._IO_MAP:
+                key, kind = self._IO_MAP[id_num]
+                if kind == "switch":
+                    on = float(val_num) != 0.0
+                    self._set_nested(key, "ON" if on else "OFF")
+                    self._set_nested(f"{key}_raw", int(float(val_num)))
+                elif kind == "numeric":
+                    self._set_nested(key, int(float(val_num)))
+                elif kind == "float_100":
+                    self._set_nested(key, float(val_num))
+                if ".setpoint" in key:     self._set_nested(key.split(".")[0] + ".setpoint", float(val_num))
+                if ".totalisator" in key: self._set_nested(key.split(".")[0] + ".totalisator", float(val_num))
+            return
+
+        m_sens = re.search(r"^([a-z0-9_]+)\s*:\s*([+-]?\d+(?:\.\d+)?)\s*(kpa|°c|c)?\s*\((\d+)\)\s*$", low)
+        if m_sens:
+            name, value = m_sens.group(1), float(m_sens.group(2))
+            self._set_nested(name, value)
+            self._set_nested(f"{name}_code", int(m_sens.group(4)))
+            return
+
+        m_unit = re.search(r"^\s*unit:\s*(.+)$", low)
+        if m_unit:
+            unit = m_unit.group(1).strip()
+            target = self._get_current_mfc()
+            if target: self._set_nested(f"{target}.unit", unit)
+            return
+
+        m_flow_named = re.search(r"^\s*flow\s+(butan|co2|n2)\s*:\s*([+-]?\d+(?:\.\d+)?)", low)
+        if m_flow_named:
+            gas, val = m_flow_named.group(1), float(m_flow_named.group(2))
+            mfc = {"butan": "mfc_butan", "co2": "mfc_co2", "n2": "mfc_n2"}[gas]
+            self._set_nested(f"{mfc}.flow", val)
+            return
+
+        m_temp = re.search(r"^\s*temperature\s*:\s*([+-]?\d+(?:\.\d+)?)", low)
+        if m_temp:
+            target = self._get_current_mfc()
+            if target: self._set_nested(f"{target}.temperature", float(m_temp.group(1)))
+            return
+
 
 
 # ====================== High-level Driver ======================
