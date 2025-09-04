@@ -14,7 +14,7 @@ print("##########################")
 print("#### init Driver... ######")
 print("##########################")
 driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
-time.sleep(1)
+time.sleep(10)
 try:
     driver.get_all_status()
     print("##########################")
