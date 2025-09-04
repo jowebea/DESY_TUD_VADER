@@ -12,7 +12,7 @@ MAXI_PORT  = "/dev/ttyACM1"
 logging.basicConfig(level=logging.DEBUG)
 print("init Driver...")
 driver = VaderDeviceDriver(MINI1_PORT, MINI2_PORT, MAXI_PORT)
-time.sleep(5)
+time.sleep(20)
 try:
     driver.get_all_status()
     print("Setting N2 to 5nl/min...")
