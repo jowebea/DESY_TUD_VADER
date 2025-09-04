@@ -486,9 +486,9 @@ if __name__ == "__main__":
     print("testing VaderDeviceDriver...")
     print("assigning Ports...")
     # macOS: ersetze durch deine Ports (siehe ls /dev/cu.*)
-    MINI1_PORT = "/dev/cu.usbmodem1133101"
-    MINI2_PORT = "/dev/cu.usbmodem1133301"
-    MAXI_PORT  = "/dev/cu.usbmodem1133201"
+    MINI1_PORT = "/dev/ttyACM0"
+    MINI2_PORT = "/dev/ttyACM2"
+    MAXI_PORT  = "/dev/ttyACM1"
 
     logging.basicConfig(level=logging.INFO)
     print("init Driver...")
