@@ -247,7 +247,7 @@ class MAXI:
         41: ("mfc_n2.totalisator", "float_100"),
     }
 
-    def __init__(self, port: str, status_timeout: float = 1.0):
+    def __init__(self, port: str, status_timeout: float = 2.0):
         self.dev = SerialDevice(port, 115200, name="MAXI")
         self.status: Dict[str, Any] = {}
         self._lock = threading.Lock()
