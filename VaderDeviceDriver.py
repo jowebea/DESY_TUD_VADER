@@ -259,6 +259,7 @@ class MAXI:
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
         logging.info("MAXI initialisiert auf Port %s", port)
+        time.sleep(10)
         # Direkt initialen Status anfordern
         if self.request_status(timeout=self._status_timeout_default):
             logging.info("Initialer Status erfolgreich empfangen.")
@@ -403,7 +404,7 @@ class MAXI:
         time.sleep(0.05)
         self.dev.close()
 
-        
+
 # ====================== High-level Driver ======================
 class VaderDeviceDriver:
     def __init__(self, mini1_port: str, mini2_port: str, maxi_port: str, mini1_max_samples: int = 300_000):
@@ -455,7 +456,6 @@ class VaderDeviceDriver:
         self.mini2.request_status()
         self.maxi.request_status()
         self.mini2._wait_for_recent_status(0.5)    
-        self.maxi.wait_for_fresh_status(timeout=30) 
 
         return {
             "mini1": {
