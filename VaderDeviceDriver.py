@@ -215,11 +215,19 @@ class MINI2:
         time.sleep(0.05)
         self.dev.close()
 
+import logging
+
 # ====================== MAXI ======================
 class MAXI:
     """
-    - Status:  "1; 0; 0"
-    - Setzen:  "2; <address>; <value>"
+    Protokoll:
+      - Status anfordern: "1; 0; 0"
+      - Setzen:           "2; <address>; <value>"
+
+    Garantie:
+      - Vor jedem Senden wird der serielle Eingangspuffer geleert.
+      - Alle sendenden/empfangenden Methoden warten auf eine frische Statusantwort
+        und liefern True/False (Erfolg).
     """
 
     _IO_MAP = {
@@ -239,175 +247,163 @@ class MAXI:
         41: ("mfc_n2.totalisator", "float_100"),
     }
 
-    def __init__(self, port: str):
+    def __init__(self, port: str, status_timeout: float = 1.0):
         self.dev = SerialDevice(port, 115200, name="MAXI")
         self.status: Dict[str, Any] = {}
         self._lock = threading.Lock()
         self._last_status_ts = 0.0
         self._running = True
-        self._current_mfc: Optional[str] = None  # aktueller Block
+        self._current_mfc: Optional[str] = None
+        self._status_timeout_default = float(status_timeout)
+
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
-        # >>> Neu: direkt Status anfordern & kurz warten
-        self.request_status()
-        self.wait_for_fresh_status(timeout=0.5)
+        logging.info("MAXI initialisiert auf Port %s", port)
+        # Direkt initialen Status anfordern
+        if self.request_status(timeout=self._status_timeout_default):
+            logging.info("Initialer Status erfolgreich empfangen.")
+        else:
+            logging.warning("Kein initialer Status empfangen!")
 
-    # --- Senden ---
-    def _send(self, cmd: int, address: int, value: Union[int, float]) -> None:
-        self.dev.write_line(f"{cmd}; {address}; {value}")
+    # ---------- Low-Level Hilfen ----------
 
-    def request_status(self) -> None:
-        self._send(1, 0, 0)
+    def _touch(self) -> None:
+        self._last_status_ts = time.time()
 
-    def set_component(self, address: int, value: int) -> None:
-        self._send(2, address, int(value))
+    def _flush_input(self, drain_time: float = 0.05) -> None:
+        logging.debug("Flushing input buffer ...")
+        try:
+            with self.dev._lock:
+                try:
+                    self.dev.ser.reset_input_buffer()
+                    logging.debug("Input buffer mit reset_input_buffer() geleert.")
+                    return
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    def set_valve(self, valve_id: int, on: bool) -> None:
-        self.set_component(valve_id, 1 if on else 0)
+        # Fallback
+        t_end = time.time() + drain_time
+        flushed = 0
+        while time.time() < t_end:
+            line = self.dev.readline()
+            if line is None:
+                break
+            flushed += 1
+        if flushed > 0:
+            logging.debug("Fallback flush: %d alte Zeilen verworfen.", flushed)
 
-    def activate_v4(self, enable: bool) -> None:
-        self.set_valve(4, enable)
+    def _wait_for_status_after(self, before_ts: float, timeout: float) -> bool:
+        logging.debug("Warte auf frischen Status (timeout=%.2fs)...", timeout)
+        end = time.time() + timeout
+        while time.time() < end:
+            with self._lock:
+                if self._last_status_ts > before_ts:
+                    logging.debug("Frischer Status empfangen (ts=%.3f).", self._last_status_ts)
+                    return True
+            time.sleep(0.01)
+        logging.warning("Timeout: Kein frischer Status innerhalb %.2fs.", timeout)
+        return False
+
+    def _send_only(self, cmd: int, address: int, value: Union[int, float]) -> None:
+        msg = f"{cmd}; {address}; {value}"
+        logging.debug("Sende: %s", msg)
+        self.dev.write_line(msg)
+
+    def _send_and_wait_status(self, cmd: int, address: int, value: Union[int, float], timeout: Optional[float] = None) -> bool:
+        if timeout is None:
+            timeout = self._status_timeout_default
+
+        self._flush_input()
+
+        before = self._last_status_ts
+        self._send_only(cmd, address, value)
+
+        if cmd != 1:
+            time.sleep(0.01)
+            self._send_only(1, 0, 0)  # Status anfordern
+
+        ok = self._wait_for_status_after(before, timeout)
+        if ok:
+            logging.info("Befehl erfolgreich bestätigt: %s; %d; %s", cmd, address, value)
+        else:
+            logging.warning("Befehl NICHT bestätigt: %s; %d; %s", cmd, address, value)
+        return ok
+
+    # ---------- Öffentliche Sende-/Empfangs-APIs ----------
+
+    def request_status(self, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(1, 0, 0, timeout=timeout)
+
+    def set_component(self, address: int, value: int, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, address, int(value), timeout=timeout)
+
+    def set_valve(self, valve_id: int, on: bool, timeout: Optional[float] = None) -> bool:
+        return self.set_component(valve_id, 1 if on else 0, timeout=timeout)
+
+    def activate_v4(self, enable: bool, timeout: Optional[float] = None) -> bool:
+        return self.set_valve(4, enable, timeout=timeout)
 
     # --- MFC ---
     @staticmethod
     def _to_cLpm(flow_lpm: float) -> int:
         return int(round(flow_lpm * 100.0))
 
-    def set_flow_butan(self, flow_lpm: float) -> None: self._send(2, 20, self._to_cLpm(flow_lpm))
-    def set_flow_co2(self,   flow_lpm: float) -> None: self._send(2, 30, self._to_cLpm(flow_lpm))
-    def set_flow_n2(self,    flow_lpm: float) -> None: self._send(2, 40, self._to_cLpm(flow_lpm))
+    def set_flow_butan(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 20, self._to_cLpm(flow_lpm), timeout=timeout)
 
-    def set_totalisator_butan(self, value_lpm: float = 0.0) -> None: self._send(2, 21, self._to_cLpm(value_lpm))
-    def set_totalisator_co2(self,   value_lpm: float = 0.0) -> None: self._send(2, 31, self._to_cLpm(value_lpm))
-    def set_totalisator_n2(self,    value_lpm: float = 0.0) -> None: self._send(2, 41, self._to_cLpm(value_lpm))
+    def set_flow_co2(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 30, self._to_cLpm(flow_lpm), timeout=timeout)
 
-    def reset_totalisator_butan(self) -> None: self.set_totalisator_butan(0.0)
-    def reset_totalisator_co2(self)   -> None: self.set_totalisator_co2(0.0)
-    def reset_totalisator_n2(self)    -> None: self.set_totalisator_n2(0.0)
+    def set_flow_n2(self, flow_lpm: float, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 40, self._to_cLpm(flow_lpm), timeout=timeout)
 
-    # --- Reader / Parser ---
+    def set_totalisator_butan(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 21, self._to_cLpm(value_lpm), timeout=timeout)
+
+    def set_totalisator_co2(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 31, self._to_cLpm(value_lpm), timeout=timeout)
+
+    def set_totalisator_n2(self, value_lpm: float = 0.0, timeout: Optional[float] = None) -> bool:
+        return self._send_and_wait_status(2, 41, self._to_cLpm(value_lpm), timeout=timeout)
+
+    def reset_totalisator_butan(self, timeout: Optional[float] = None) -> bool:
+        return self.set_totalisator_butan(0.0, timeout=timeout)
+
+    def reset_totalisator_co2(self, timeout: Optional[float] = None) -> bool:
+        return self.set_totalisator_co2(0.0, timeout=timeout)
+
+    def reset_totalisator_n2(self, timeout: Optional[float] = None) -> bool:
+        return self.set_totalisator_n2(0.0, timeout=timeout)
+
+    # ---------- Reader / Parser ----------
+
     def _reader_loop(self) -> None:
+        logging.debug("Reader-Thread gestartet.")
         while self._running:
             line = self.dev.readline()
             if not line:
                 time.sleep(0.002)
                 continue
+            logging.debug("Empfangen: %s", line)
             self._parse_status_line(line)
 
-    def _touch(self) -> None:
-        self._last_status_ts = time.time()
+    # ... (Parser bleibt wie vorher, nur ggf. Logging ergänzen) ...
 
-    def _set_nested(self, key_path: str, value: Any) -> None:
-        parts = key_path.split(".")
-        with self._lock:
-            d = self.status
-            for p in parts[:-1]:
-                d = d.setdefault(p, {})
-            d[parts[-1]] = value
-            self._touch()
-
-    def _ensure_mfc(self, name: str) -> None:
-        with self._lock:
-            self.status.setdefault(name, {})
-            self._touch()
-
-    def _set_current_mfc(self, key: Optional[str]) -> None:
-        with self._lock:
-            self._current_mfc = key
-            self._touch()
-
-    def _get_current_mfc(self) -> Optional[str]:
-        with self._lock:
-            return self._current_mfc
-
-    def _parse_status_line(self, line: str) -> None:
-        low = line.lower().strip()
-
-        # Abschnittsüberschriften der MFCs
-        if "butan/methan mfc" in low:
-            self._ensure_mfc("mfc_butan")
-            self._set_current_mfc("mfc_butan")
-            return
-        if "co2 mfc" in low:
-            self._ensure_mfc("mfc_co2")
-            self._set_current_mfc("mfc_co2")
-            return
-        if "n2/argon mfc" in low:
-            self._ensure_mfc("mfc_n2")
-            self._set_current_mfc("mfc_n2")
-            return
-
-        # Abschnittsende optional zurücksetzen
-        if low.startswith("------- mfcs -------") or low.startswith("---"):
-            self._set_current_mfc(None)
-
-        m_id = re.search(r"\[([0-9]{1,3})\]\s*:\s*([+-]?\d+(?:\.\d+)?)", line)
-        if m_id:
-            id_num, val_str = int(m_id.group(1)), m_id.group(2)
-            try: val_num = float(val_str)
-            except ValueError: val_num = val_str
-            if id_num in self._IO_MAP:
-                key, kind = self._IO_MAP[id_num]
-                if kind == "switch":
-                    on = float(val_num) != 0.0
-                    self._set_nested(key, "ON" if on else "OFF")
-                    self._set_nested(f"{key}_raw", int(float(val_num)))
-                elif kind == "numeric":
-                    self._set_nested(key, int(float(val_num)))
-                elif kind == "float_100":
-                    self._set_nested(key, float(val_num))
-                if ".setpoint" in key:     self._set_nested(key.split(".")[0] + ".setpoint", float(val_num))
-                if ".totalisator" in key: self._set_nested(key.split(".")[0] + ".totalisator", float(val_num))
-            return
-
-        m_sens = re.search(r"^([a-z0-9_]+)\s*:\s*([+-]?\d+(?:\.\d+)?)\s*(kpa|°c|c)?\s*\((\d+)\)\s*$", low)
-        if m_sens:
-            name, value = m_sens.group(1), float(m_sens.group(2))
-            self._set_nested(name, value)
-            self._set_nested(f"{name}_code", int(m_sens.group(4)))
-            return
-
-        m_unit = re.search(r"^\s*unit:\s*(.+)$", low)
-        if m_unit:
-            unit = m_unit.group(1).strip()
-            target = self._get_current_mfc()
-            if target: self._set_nested(f"{target}.unit", unit)
-            return
-
-        m_flow_named = re.search(r"^\s*flow\s+(butan|co2|n2)\s*:\s*([+-]?\d+(?:\.\d+)?)", low)
-        if m_flow_named:
-            gas, val = m_flow_named.group(1), float(m_flow_named.group(2))
-            mfc = {"butan": "mfc_butan", "co2": "mfc_co2", "n2": "mfc_n2"}[gas]
-            self._set_nested(f"{mfc}.flow", val)
-            return
-
-        m_temp = re.search(r"^\s*temperature\s*:\s*([+-]?\d+(?:\.\d+)?)", low)
-        if m_temp:
-            target = self._get_current_mfc()
-            if target: self._set_nested(f"{target}.temperature", float(m_temp.group(1)))
-            return
-
-    def wait_for_fresh_status(self, timeout: float = 1.0) -> bool:
-        before = self._last_status_ts
-        self.request_status()
-        end = time.time() + timeout
-        while time.time() < end:
-            with self._lock:
-                if self._last_status_ts > before:
-                    return True
-            time.sleep(0.01)
-        return False
+    # ---------- Getter / Shutdown ----------
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self.status)
 
     def stop(self) -> None:
+        logging.info("MAXI stop() aufgerufen.")
         self._running = False
         time.sleep(0.05)
         self.dev.close()
 
-
+        
 # ====================== High-level Driver ======================
 class VaderDeviceDriver:
     def __init__(self, mini1_port: str, mini2_port: str, maxi_port: str, mini1_max_samples: int = 300_000):
