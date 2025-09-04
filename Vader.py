@@ -5,7 +5,7 @@ import sys, os, csv, json, time, threading, traceback
 import PyTango as tango
 
 # === Importiere deinen Driver ===
-from vader_driver import VaderDeviceDriver  # ggf. Pfad anpassen
+import VaderDeviceDriver  # ggf. Pfad anpassen
 
 # ====== Hilfsfunktionen ======
 def now_ts():
