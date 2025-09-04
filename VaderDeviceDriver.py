@@ -259,7 +259,7 @@ class MAXI:
         threading.Thread(target=self._reader_loop, daemon=True).start()
 
         logging.info("MAXI initialisiert auf Port %s", port)
-        time.sleep(10)
+        time.sleep(0.5)
         # Direkt initialen Status anfordern
         if self.request_status(timeout=self._status_timeout_default):
             logging.info("Initialer Status erfolgreich empfangen.")
@@ -534,7 +534,7 @@ class VaderDeviceDriver:
 
     def use_gas(self, n2: int, co2: int, butan: int) -> None:
         # Eingaben 0..10 -> l/min 
-        self.maxi.set_flow_n2(flow=n2); self.maxi.set_flow_co2(flow=co2); self.maxi.set_flow_butan(flow=butan)
+        self.maxi.set_flow_n2(self,low=n2); self.maxi.set_flow_co2(self,flow=co2); self.maxi.set_flow_butan(self,flow=butan)
 
     def setpoint_pressure(self, kpa: Union[int, float]) -> None:
         self.mini2.set_target_pressure(kpa)
