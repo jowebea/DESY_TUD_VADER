@@ -373,7 +373,6 @@ class MAXI:
         return self.set_valve(4, enable, timeout=timeout)
 
     # --- MFC ---
-    @staticmethod
     def set_flow_butan(self, flow: float, timeout: Optional[float] = None) -> bool:
         return self._send_and_wait_status(2, 20, flow, timeout=timeout)
 
