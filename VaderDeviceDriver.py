@@ -332,6 +332,32 @@ class MAXI:
             logging.warning("Befehl NICHT bestätigt: %s; %d; %s", cmd, address, value)
         return ok
 
+    def _set_nested(self, dotted_key: str, value: Any) -> None:
+        """Schreibt einen Wert in self.status anhand eines dotted keys, z.B. 'mfc_co2.setpoint'."""
+        with self._lock:
+            node = self.status
+            parts = dotted_key.split(".")
+            for p in parts[:-1]:
+                node = node.setdefault(p, {})
+            node[parts[-1]] = value
+            self._touch()  # markiere, dass frischer Status vorliegt
+
+    def _ensure_mfc(self, name: str) -> None:
+        """Stellt sicher, dass ein MFC-Unterknoten existiert."""
+        with self._lock:
+            self.status.setdefault(name, {})
+            # typische Felder anlegen (optional)
+            self.status[name].setdefault("setpoint", None)
+            self.status[name].setdefault("totalisator", None)
+
+    def _set_current_mfc(self, name: Optional[str]) -> None:
+        with self._lock:
+            self._current_mfc = name
+
+    def _get_current_mfc(self) -> Optional[str]:
+        with self._lock:
+            return self._current_mfc
+        
     # ---------- Öffentliche Sende-/Empfangs-APIs ----------
 
     def request_status(self, timeout: Optional[float] = None) -> bool:
@@ -506,9 +532,9 @@ class VaderDeviceDriver:
         self.mini2.set_target_pressure(0)
         
 
-    def use_gas(self, n2: float, co2: float, butan: float) -> None:
-        # Eingaben 0..100 -> l/min = value/10
-        self.maxi.set_flow_n2(n2/10.0); self.maxi.set_flow_co2(co2/10.0); self.maxi.set_flow_butan(butan/10.0)
+    def use_gas(self, n2: int, co2: int, butan: int) -> None:
+        # Eingaben 0..10 -> l/min 
+        self.maxi.set_flow_n2(n2); self.maxi.set_flow_co2(co2); self.maxi.set_flow_butan(butan)
 
     def setpoint_pressure(self, kpa: Union[int, float]) -> None:
         self.mini2.set_target_pressure(kpa)
