@@ -16,20 +16,20 @@ def generate_pressure_csv(filename="pressure_program.csv"):
         
         # 1) Hold 120s at 0 kPa
         hold_time = 120 * 1000
-        rows.append((hold_time, 0))
+        rows.append((int(hold_time), 0))
         
         # 2) Ramp up to 120 kPa
         for p in range(1, 121):  # von 1 bis 120 kPa
-            rows.append((round(dt_per_kPa, 3), p))
+            rows.append((int(dt_per_kPa), p))
         
         # 3) Hold at 120 kPa for 60s
         hold_time = 60 * 1000
-        rows.append((hold_time, 120))
+        rows.append((int(hold_time), 120))
         
         # 4) Ramp down to 0 kPa
         for p in range(119, -1, -1):  # von 119 zurück bis 0
             hold_time = dt_per_kPa
-            rows.append((round(dt_per_kPa, 3), p))
+            rows.append((int(dt_per_kPa), p))
 
     # Schreiben ins CSV
     with open(filename, mode="w", newline="") as f:
