@@ -1,12 +1,6 @@
 /*
- ──────────────────────────────────────────────────────────────────────────────
   Controllino-SPS – Druckregelung                           (Debounce entfernt)
- ──────────────────────────────────────────────────────────────────────────────
-  Änderungen 2025-06-06-b
-  • Debounce-Zeit für Schutzventil VS2 entfernt
-    → Ventil kann sofort schließen, sobald 191 kPa überschritten werden
-      bzw. sofort wieder öffnen, wenn der Druck unter 170 kPa fällt
- ──────────────────────────────────────────────────────────────────────────────
+  + Rampenfunktion (STATE_MACHINE: STATE_NORMAL / STATE_RAMP)
 */
 
 #include <Controllino.h>
@@ -14,14 +8,15 @@
 #include <RunningMedian.h>
 
 /* --------------------------- Kommunikation -------------------------------- */
-struct control_message { int command, address, value; } cm;
+struct control_message { int command, address; long value; } cm;  // value jetzt 32-bit
 
-#define NO_COMMAND   0
-#define SEND_STATUS  1
-#define SET          2
-#define ADR_TARGET_P 3
-#define ADR_ERR     13
-#define ADR_MAXSTEP  6
+#define NO_COMMAND    0
+#define SEND_STATUS   1
+#define SET           2
+#define ADR_TARGET_P  3
+#define ADR_ERR      13
+#define ADR_MAXSTEP   6
+#define ADR_SET_RAMP  4   // NEU: "set ramp" -> 2; 4; {params}
 
 /* --------------------------- Hardware ------------------------------------- */
 #define P20          CONTROLLINO_A1
@@ -33,9 +28,9 @@ struct control_message { int command, address, value; } cm;
 
 #define CLOSE 0
 #define OPEN  1
-#define PWM_MAX_CMD     225
+#define PWM_MAX_CMD          225
 #define PWM_MIN_OFFSET_VP1   116
-#define PWM_MIN_OFFSET_VP2   98
+#define PWM_MIN_OFFSET_VP2    98
 
 /* --------------------------- Globale Variablen ---------------------------- */
 bool  ERROR = false;
@@ -51,6 +46,16 @@ byte vs2State = OPEN;             // aktueller Ventilzustand
 
 const float DEADBAND_KPA        = 0.5;
 const float LOW_PRESSURE_LIMIT  = 150.0;
+
+/* --------------------------- State Machine (NEU) -------------------------- */
+enum ControlState { STATE_NORMAL = 0, STATE_RAMP = 1 };
+ControlState ctrl_state = STATE_NORMAL;
+
+float ramp_speed_kpa_s = 0.0f;   // Betrag in kPa/s (Vorzeichen folgt Richtung start→end)
+float ramp_start_kpa   = 0.0f;
+float ramp_end_kpa     = 0.0f;
+int   ramp_dir         = +1;     // +1: aufwärts, -1: abwärts
+unsigned long ramp_t0_ms = 0;
 
 /* --------------------------- Sensor-Kalibrierung -------------------------- */
 inline float mapP21(int adc) { return (adc + 3.24) / 0.279; }   // kPa
@@ -94,7 +99,7 @@ const float Kp_decrease = 0.0;
 const float KI_per_100ms = 1.0;            // Integralzuwachs bei 100 ms
 const int OFFSET_INCREASE = 98;            // Basis für Druck erhöhen
 const int OFFSET_DECREASE = 116;           // Basis für Druck reduzieren
-const int TOLERANCE = 2;                   // Sollwert-Toleranz (in denselben Einheiten wie Druck)
+const int TOLERANCE = 2;                   // Sollwert-Toleranz (Einheit wie Druck)
 
 // Interne Zustände
 float integral_increase = 0;
@@ -165,6 +170,32 @@ void control_pressure() {
 
 }
 
+/* --------------------------- Rampen-Logik (NEU) --------------------------- */
+inline void update_ramp_target_if_active() {
+  if (ctrl_state != STATE_RAMP) return;
+
+  // Sonderfälle: keine Bewegung notwendig
+  if (ramp_speed_kpa_s <= 0.0f || fabs(ramp_end_kpa - ramp_start_kpa) < 1e-6) {
+    target_p = ramp_end_kpa;
+    ctrl_state = STATE_NORMAL;
+    return;
+  }
+
+  unsigned long elapsed_ms = millis() - ramp_t0_ms;
+  float elapsed_s = elapsed_ms / 1000.0f;
+
+  float candidate = ramp_start_kpa + ramp_dir * ramp_speed_kpa_s * elapsed_s;
+
+  // Begrenzen und State beenden, wenn Ziel erreicht/überschritten
+  if ((ramp_dir > 0 && candidate >= ramp_end_kpa) ||
+      (ramp_dir < 0 && candidate <= ramp_end_kpa)) {
+    target_p = ramp_end_kpa;
+    ctrl_state = STATE_NORMAL;
+  } else {
+    target_p = candidate;
+  }
+}
+
 /* --------------------------- Kommunikation -------------------------------- */
 control_message read_serial_command()
 {
@@ -172,7 +203,7 @@ control_message read_serial_command()
     while (Serial.available()) {
         r.command =  Serial.readStringUntil(';').toInt(); Serial.read();
         r.address =  Serial.readStringUntil(';').toInt(); Serial.read();
-        r.value   =  Serial.readStringUntil('\n').toInt();
+        r.value   =  Serial.readStringUntil('\n').toInt();   // 32-bit Wert
     }
     return r;
 }
@@ -188,13 +219,45 @@ void send_status()
     Serial.print("Setpoint: ");      Serial.println(target_p);
     Serial.print("PWM1: ");          Serial.println(pwmVP1);
     Serial.print("PWM2: ");          Serial.println(pwmVP2);
+    // Optional: State-Ausgabe
+    Serial.print("STATE: ");         Serial.println(ctrl_state==STATE_RAMP ? "RAMP" : "NORMAL");
 }
 
-void set(int adr,int val){
+void start_ramp_from_params(uint32_t params)
+{
+    // params: [8 bit speed][10 bit start][10 bit end]
+    uint8_t  speed8   = (params >> 20) & 0xFF;
+    uint16_t start10  = (params >> 10) & 0x3FF;
+    uint16_t end10    =  params        & 0x3FF;
+
+    ramp_speed_kpa_s = (float)speed8;   // Betrag; Richtung separat
+    ramp_start_kpa   = (float)start10;
+    ramp_end_kpa     = (float)end10;
+
+    ramp_dir         = (ramp_end_kpa >= ramp_start_kpa) ? +1 : -1;
+
+    target_p         = ramp_start_kpa;  // sofort auf Startwert setzen
+    ramp_t0_ms       = millis();
+    ctrl_state       = STATE_RAMP;
+}
+
+void set(int adr, long val){
     switch(adr){
-        case ADR_TARGET_P: target_p = val; break;
-        case ADR_MAXSTEP : max_pwm_step = constrain(val,1,255); break;
-        case ADR_ERR     : ERROR = val;    break;
+        case ADR_TARGET_P:
+            target_p   = (float)val;
+            ctrl_state = STATE_NORMAL;       // Rampenmodus verlassen, wie gefordert
+            break;
+        case ADR_MAXSTEP :
+            max_pwm_step = constrain((int)val,1,255);
+            break;
+        case ADR_ERR     :
+            ERROR = (bool)val;
+            break;
+        case ADR_SET_RAMP: {                 // NEU: "set ramp"
+            uint32_t params = (uint32_t)val;
+            start_ramp_from_params(params);
+            break;
+        }
     }
 }
 
@@ -218,5 +281,8 @@ void loop()
     if      (cm.command == SEND_STATUS) send_status();
     else if (cm.command == SET)         set(cm.address, cm.value);
 
-    for (int i=0;i<50;i++){ protect_sensors(); control_pressure(); }
+    // Rampen-Ziel ggf. fortschreiben
+    update_ramp_target_if_active();
+
+    for (int i=0;i<5;i++){ protect_sensors(); control_pressure(); }
 }
