@@ -17,6 +17,7 @@ struct control_message { int command, address; long value; } cm;  // value jetzt
 #define ADR_ERR      13
 #define ADR_MAXSTEP   6
 #define ADR_SET_RAMP  4   // NEU: "set ramp" -> 2; 4; {params}
+#define ADR_SET_EVAC  5   // Both VP1, VP2 = 255
 
 /* --------------------------- Hardware ------------------------------------- */
 #define P20          CONTROLLINO_A1
@@ -48,7 +49,7 @@ const float DEADBAND_KPA        = 0.5;
 const float LOW_PRESSURE_LIMIT  = 150.0;
 
 /* --------------------------- State Machine (NEU) -------------------------- */
-enum ControlState { STATE_NORMAL = 0, STATE_RAMP = 1 };
+enum ControlState { STATE_NORMAL = 0, STATE_RAMP = 1, STATE_EVAC = 2 };
 ControlState ctrl_state = STATE_NORMAL;
 
 float ramp_speed_kpa_s = 0.0f;   // Betrag in kPa/s (Vorzeichen folgt Richtung start→end)
@@ -238,7 +239,6 @@ void start_ramp_from_params(uint32_t params)
 
     target_p         = ramp_start_kpa;  // sofort auf Startwert setzen
     ramp_t0_ms       = millis();
-    ctrl_state       = STATE_RAMP;
 }
 
 void set(int adr, long val){
@@ -255,7 +255,16 @@ void set(int adr, long val){
             break;
         case ADR_SET_RAMP: {                 // NEU: "set ramp"
             uint32_t params = (uint32_t)val;
+            ctrl_state       = STATE_RAMP;
             start_ramp_from_params(params);
+            break;
+        }
+        case ADR_SET_EVAC: { 
+            ctrl_state = STATE_EVAC;
+            analogWrite(VP1_PIN, 255);
+            pwmVP1 = 255; 
+            analogWrite(VP2_PIN, 255);
+            pwmVP2 = 255;
             break;
         }
     }
@@ -279,10 +288,13 @@ void loop()
 
     cm = read_serial_command();
     if      (cm.command == SEND_STATUS) send_status();
-    else if (cm.command == SET)         set(cm.address, cm.value);
+    else if (cm.command == SET){
+      set(cm.address, cm.value);
+      }         
 
-    // Rampen-Ziel ggf. fortschreiben
-    update_ramp_target_if_active();
-
-    for (int i=0;i<5;i++){ protect_sensors(); control_pressure(); }
+    if (ctrl_state != STATE_EVAC){
+      // Rampen-Ziel ggf. fortschreiben
+      update_ramp_target_if_active();
+      for (int i=0;i<5;i++){ protect_sensors(); control_pressure(); }
+    }
 }
