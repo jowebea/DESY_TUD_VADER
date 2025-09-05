@@ -1,0 +1,9 @@
+[
+  {"type": "Normal", "target_pressure": 0},
+  {"type": "delay",  "delay_time": 5000},
+  {"type": "Ramp",   "start_pressure": 0, "end_pressure": 140, "ramp_speed": 100},
+  {"type": "delay",  "delay_time": 10000},
+  {"type": "Ramp",   "start_pressure": 140, "end_pressure": 0, "ramp_speed": 100},
+  {"type": "delay",  "delay_time": 10000}
+   
+]
