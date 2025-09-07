@@ -13,7 +13,7 @@ from tango.server import Device, attribute, command, run, device_property
 
 # === Treiber (ANPASSEN!) ===
 # Beispiel: from drivers.vader_driver import VaderDeviceDriver
-from your_driver_module import VaderDeviceDriver  # <-- ANPASSEN!
+from VaderDeviceDriver import VaderDeviceDriver
 
 
 # ---------------- JSON-Programm lesen ----------------
