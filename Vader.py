@@ -7,7 +7,7 @@ import time
 from typing import Optional, Dict, Any, List
 
 # === pyTango ===
-from tango import DevState, DevLong, AttrDataFormat
+from tango import DevState, DevLong, AttrDataFormat, AttrWriteType
 from tango.server import Device, attribute, command, run, device_property
 # === Treiber (ANPASSEN!) ===
 from VaderDeviceDriver import VaderDeviceDriver
