@@ -463,7 +463,7 @@ class _Mini2Emu(_BaseEmu):
         # BASE+2: P20, BASE+3: P21, BASE+4: MODE/PWM
         mode2 = {"MANUAL":0, "RAMP":1, "AUTOMATIC":2}.get(self.mode, 3)
         p20_raw = int(round(max(0.0, min(0xFFFF/10.0, self.p20)) * 10))
-        p21_raw = int(round(max(0.0, min(0.0xFFFF/10.0, self.p21)) * 10))
+        # p21_raw = int(round(max(0.0, min(0.0xFFFF/10.0, self.p21)) * 10))
         # Achtung Tippfehler: 0.0xFFFF -> 0xFFFF (fix)
         p21_raw = int(round(max(0.0, min(0xFFFF/10.0, self.p21)) * 10))
 
