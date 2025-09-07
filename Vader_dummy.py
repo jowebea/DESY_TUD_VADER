@@ -38,9 +38,9 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
 class VaderDummyDS(Device):
     """
     Dummy-Tango-Server zum Testen des Interfaces.
-    Simuliert MINI1/2/MAXI mit:
+    Simuliert MINI1/2/MAXI:
       - Drucksim (20 Hz)
-      - Status/Flows/Totals (0.5 Hz sichtbar, kontinuierlich intern)
+      - Status/Flows/Totals (0.5 Hz sichtbar)
       - JSON-Programm (Normal/Ramp/delay)
     """
 
@@ -54,23 +54,61 @@ class VaderDummyDS(Device):
     def Storage(self) -> bool:
         return bool(self._io["V1"] and self._io["V2"])
 
-    @attribute(dtype=bool)  def V1(self) -> bool: return bool(self._io["V1"])
-    @attribute(dtype=bool)  def V2(self) -> bool: return bool(self._io["V2"])
-    @attribute(dtype=bool)  def V3(self) -> bool: return bool(self._io["V3"])
-    @attribute(dtype=bool)  def Fans(self) -> bool: return bool(self._io["FanIn"] and self._io["FanOut"])
-    @attribute(dtype=bool)  def GasLeak(self) -> bool: return bool(self._io["GasLeak"])
+    @attribute(dtype=bool)
+    def V1(self) -> bool:
+        return bool(self._io["V1"])
 
-    @attribute(dtype=float) def FlowButan(self) -> float: return float(self._mfc["butan"]["flow"])
-    @attribute(dtype=float) def FlowCO2(self)   -> float: return float(self._mfc["co2"]["flow"])
-    @attribute(dtype=float) def FlowN2(self)    -> float: return float(self._mfc["n2"]["flow"])
+    @attribute(dtype=bool)
+    def V2(self) -> bool:
+        return bool(self._io["V2"])
 
-    @attribute(dtype=float) def TotalButan(self) -> float: return float(self._mfc["butan"]["total"])
-    @attribute(dtype=float) def TotalCO2(self)   -> float: return float(self._mfc["co2"]["total"])
-    @attribute(dtype=float) def TotalN2(self)    -> float: return float(self._mfc["n2"]["total"])
+    @attribute(dtype=bool)
+    def V3(self) -> bool:
+        return bool(self._io["V3"])
 
-    @attribute(dtype=float) def setPoint_pressure(self) -> float: return float(self._mini2["setpoint_kpa"])
-    @attribute(dtype=int)   def vp1(self) -> int: return int(self._mini2["pwm1"])
-    @attribute(dtype=int)   def vp2(self) -> int: return int(self._mini2["pwm2"])
+    @attribute(dtype=bool)
+    def Fans(self) -> bool:
+        return bool(self._io["FanIn"] and self._io["FanOut"])
+
+    @attribute(dtype=bool)
+    def GasLeak(self) -> bool:
+        return bool(self._io["GasLeak"])
+
+    @attribute(dtype=float)
+    def FlowButan(self) -> float:
+        return float(self._mfc["butan"]["flow"])
+
+    @attribute(dtype=float)
+    def FlowCO2(self) -> float:
+        return float(self._mfc["co2"]["flow"])
+
+    @attribute(dtype=float)
+    def FlowN2(self) -> float:
+        return float(self._mfc["n2"]["flow"])
+
+    @attribute(dtype=float)
+    def TotalButan(self) -> float:
+        return float(self._mfc["butan"]["total"])
+
+    @attribute(dtype=float)
+    def TotalCO2(self) -> float:
+        return float(self._mfc["co2"]["total"])
+
+    @attribute(dtype=float)
+    def TotalN2(self) -> float:
+        return float(self._mfc["n2"]["total"])
+
+    @attribute(dtype=float)
+    def setPoint_pressure(self) -> float:
+        return float(self._mini2["setpoint_kpa"])
+
+    @attribute(dtype=int)
+    def vp1(self) -> int:
+        return int(self._mini2["pwm1"])
+
+    @attribute(dtype=int)
+    def vp2(self) -> int:
+        return int(self._mini2["pwm2"])
 
     # ------------- Kommandos (manuelles Setzen) -------------
     @command(dtype_in=bool)  # V1+V2 gemeinsam
@@ -114,7 +152,6 @@ class VaderDummyDS(Device):
     @command(dtype_in=float)
     def SetSetPointPressure(self, kpa: float):
         self._mini2["setpoint_kpa"] = float(kpa)
-        # Startet ggf. sanfte „Regelung“ im 20 Hz Loop
 
     @command(dtype_in=int)
     def SetVP1(self, value: int):
@@ -164,11 +201,9 @@ class VaderDummyDS(Device):
         self._prog_thread = None
 
         # Poll-/Simulations-Threads
-        #   MINI1: 20 Hz (Druckmodell & Totals-Integration in Echtzeit)
-        self._t_mini1 = threading.Thread(target=self._loop_mini1_20hz, daemon=True)
-        #   MINI2/MAXI: 0.5 Hz (sichtbare „Refresh“-Aktionen – hier nur Statuspflege)
-        self._t_mini2 = threading.Thread(target=self._loop_mini2_05hz, daemon=True)
-        self._t_maxi  = threading.Thread(target=self._loop_maxi_05hz,  daemon=True)
+        self._t_mini1 = threading.Thread(target=self._loop_mini1_20hz, daemon=True)  # 20 Hz
+        self._t_mini2 = threading.Thread(target=self._loop_mini2_05hz, daemon=True)  # 0.5 Hz
+        self._t_maxi  = threading.Thread(target=self._loop_maxi_05hz,  daemon=True)  # 0.5 Hz
 
         self._last_integrate = time.time()
         self._t_mini1.start()
@@ -209,27 +244,23 @@ class VaderDummyDS(Device):
             # Druckmodell
             sp = float(self._mini2["setpoint_kpa"])
             p  = float(self._mini1["pressure_kpa"])
-            # Einfluss der PWM (mehr PWM -> schnellere Annäherung)
             pwm_gain = 1.0 + 0.01 * (self._mini2["pwm1"] + self._mini2["pwm2"])  # 1 .. ~6.1
             tau = tau_base / pwm_gain
             dp = (sp - p) * (dt / max(0.3, tau))
-            # kleines Rauschen
-            dp += random.gauss(0.0, 0.01)
-            # Grenzen
+            dp += random.gauss(0.0, 0.01)  # Rauschen
             p = max(0.0, p + dp)
             self._mini1["pressure_kpa"] = p
 
             # Flows integrieren -> Totals
             for gas in ("butan", "co2", "n2"):
-                flow = float(self._mfc[gas]["flow"])  # „Einheit“: z.B. l/min – Integration entsprechend
+                flow = float(self._mfc[gas]["flow"])  # Einheit z. B. l/min
                 self._mfc[gas]["total"] += max(0.0, flow) * (dt / 60.0)
 
-            # GasLeak-„Heuristik“: Wenn hohe Flows bei geschlossenen Fans, erhöhte Chance
+            # GasLeak-Heuristik
             if (self._mfc["butan"]["flow"] + self._mfc["co2"]["flow"] + self._mfc["n2"]["flow"]) > 5.0 and not self._io["FanIn"] and not self._io["FanOut"]:
                 leak_prob = 0.05
             else:
                 leak_prob = 0.005
-            # Stochastische Blips (kurz)
             self._io["GasLeak"] = (random.random() < leak_prob)
 
             # Loop timing
@@ -237,11 +268,10 @@ class VaderDummyDS(Device):
             time.sleep(max(0.0, period - elapsed))
 
     def _loop_mini2_05hz(self):
-        """0.5 Hz: Statuspflege MINI2 (hier nur Mode-Ableitung + sanftes „Halteverhalten“)."""
+        """0.5 Hz: Statuspflege MINI2 (hier nur Mode-Ableitung)."""
         period = 2.0
         while not self._stop_evt.is_set():
             try:
-                # Mode abschätzen
                 if abs(self._mini2["setpoint_kpa"] - self._mini1["pressure_kpa"]) > 2.0:
                     mode = "AUTOMATIC"
                 elif (self._mini2["pwm1"] + self._mini2["pwm2"]) > 0:
@@ -257,7 +287,6 @@ class VaderDummyDS(Device):
         """0.5 Hz: Sichtbarer Refresh für MAXI (hier keine zusätzliche Physik nötig)."""
         period = 2.0
         while not self._stop_evt.is_set():
-            # könnte hier z. B. Status „einrasten“ lassen o. Ä.
             time.sleep(period)
 
     # ------------- Programm-Worker -------------
@@ -289,19 +318,21 @@ class VaderDummyDS(Device):
                     self._mini2["setpoint_kpa"] = start_p
                     time.sleep(0.2)
 
-                    # Rampe simulieren: setpoint linear bewegen, Physik-Loop folgt
+                    # Rampe: setpoint linear bewegen
                     direction = 1.0 if end_p >= start_p else -1.0
                     sp = start_p
                     t_last = time.time()
                     while (direction > 0 and sp < end_p) or (direction < 0 and sp > end_p):
-                        if self._prog_stop.is_set(): break
+                        if self._prog_stop.is_set():
+                            break
                         now = time.time()
                         dt = now - t_last
                         t_last = now
                         sp += direction * speed * dt
-                        # Clamp
-                        if direction > 0: sp = min(sp, end_p)
-                        else:             sp = max(sp, end_p)
+                        if direction > 0:
+                            sp = min(sp, end_p)
+                        else:
+                            sp = max(sp, end_p)
                         self._mini2["setpoint_kpa"] = sp
                         time.sleep(0.05)
 
@@ -309,12 +340,13 @@ class VaderDummyDS(Device):
                     ms = int(step["delay_time"])
                     t_end = time.time() + ms / 1000.0
                     while time.time() < t_end:
-                        if self._prog_stop.is_set(): break
+                        if self._prog_stop.is_set():
+                            break
                         time.sleep(0.05)
 
             except Exception as e:
                 self.set_status(f"Programm-Schrittfehler: {e}")
-                # weiter mit nächstem Schritt
+                continue
 
         self.set_status("Programm abgeschlossen.")
 
