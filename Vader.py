@@ -75,7 +75,7 @@ class VaderDS(Device):
     def GasLeak(self) -> bool:
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
-    # Flows (l/min o.ä., SI – Treiber skaliert)
+    # Flows (l/min o.ä., SI - Treiber skaliert)
     @attribute(dtype=float)
     def FlowButan(self) -> float: return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
 
@@ -106,7 +106,7 @@ class VaderDS(Device):
     def vp2(self) -> int: return int(self.cache_mini2.get("pwm2") or 0)
 
     # ============ Schreib-Attribute (optional via Commands; hier read-only) ============
-    # (Du wolltest "manuelles Setzen" als Funktionen/Kommandos – daher sind die Attribute selbst read-only.)
+    # (Du wolltest "manuelles Setzen" als Funktionen/Kommandos - daher sind die Attribute selbst read-only.)
 
     # ============ Kommandos (manuelles Setzen) ============
     @command(dtype_in=bool)
@@ -273,7 +273,7 @@ class VaderDS(Device):
                 self.cache_mini2["pwm1"] = int(status.get("pwm1") or 0)
                 self.cache_mini2["pwm2"] = int(status.get("pwm2") or 0)
                 self.cache_mini2["mode"] = status.get("mode") or "UNKNOWN"
-                # setpoint ist nicht im Status – wir halten den letzten gesetzten Wert im Cache
+                # setpoint ist nicht im Status - wir halten den letzten gesetzten Wert im Cache
                 # optional: aus Druckfeldern (p20/p21) könnte man "pressure_kpa" übernehmen
                 self.cache_mini2["ts"] = time.time()
             except Exception:
@@ -292,7 +292,7 @@ class VaderDS(Device):
                 for k in ("V1", "V2", "FanIn", "FanOut", "GasLeak"):
                     if k in io:
                         self.cache_maxi["io"][k] = bool(io[k])
-                # (V3 ist in MAXI-Status nicht explizit – wir führen es lokal nach SetV3)
+                # (V3 ist in MAXI-Status nicht explizit - wir führen es lokal nach SetV3)
                 # mfc
                 mfc = status.get("mfc") or {}
                 for gas in ("butan", "co2", "n2"):
