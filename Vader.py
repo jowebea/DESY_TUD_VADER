@@ -7,9 +7,8 @@ import time
 from typing import Optional, Dict, Any, List
 
 # === pyTango ===
-from tango import DevState, AttrWriteType
+from tango import DevState, DevLong, AttrDataFormat
 from tango.server import Device, attribute, command, run, device_property
-
 # === Treiber (ANPASSEN!) ===
 from VaderDeviceDriver import VaderDeviceDriver
 
@@ -156,21 +155,33 @@ class Vader(Device):
         self.driver.setpoint_pressure(float(value))
         self.cache_mini2["setpoint_kpa"] = float(value)
 
-    @attribute(dtype=int, access=AttrWriteType.READ_WRITE)   # vp1 (PWM_in)
+    @attribute(
+        dtype=DevLong,
+        access=AttrWriteType.READ_WRITE,
+        dformat=AttrDataFormat.SCALAR,
+        min_value=0, max_value=255
+    )
     def vp1(self) -> int:
         return int(self.cache_mini2.get("pwm1") or 0)
 
     def write_vp1(self, value: int):
-        self.driver.set_manual_PWM_in(int(value))
-        self.cache_mini2["pwm1"] = int(value)
+        v = max(0, min(255, int(value)))
+        self.driver.set_manual_PWM_in(v)
+        self.cache_mini2["pwm1"] = v
 
-    @attribute(dtype=int, access=AttrWriteType.READ_WRITE)   # vp2 (PWM_out)
+    @attribute(
+        dtype=DevLong,
+        access=AttrWriteType.READ_WRITE,
+        dformat=AttrDataFormat.SCALAR,
+        min_value=0, max_value=255
+    )
     def vp2(self) -> int:
         return int(self.cache_mini2.get("pwm2") or 0)
 
     def write_vp2(self, value: int):
-        self.driver.set_manual_PWM_out(int(value))
-        self.cache_mini2["pwm2"] = int(value)
+        v = max(0, min(255, int(value)))
+        self.driver.set_manual_PWM_out(v)
+        self.cache_mini2["pwm2"] = v
 
     # ============ Programmsteuerung ============
     @command(dtype_in=str)
