@@ -7,8 +7,9 @@ import time
 from typing import Optional, Dict, Any, List
 
 # === pyTango ===
-from tango import DevState, DevLong, AttrDataFormat, AttrWriteType
+from tango import DevState, AttrWriteType, DevLong, AttrDataFormat
 from tango.server import Device, attribute, command, run, device_property
+
 # === Treiber (ANPASSEN!) ===
 from VaderDeviceDriver import VaderDeviceDriver
 
@@ -43,14 +44,12 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
 
 
 class Vader(Device):
-    # ============ Geräteeigenschaften (im Tango-DB konfigurierbar) ============
+    # ============ Geräteeigenschaften ============
     mini1_port = device_property(dtype=str, default_value="mock://mini1")
     mini2_port = device_property(dtype=str, default_value="mock://mini2")
     maxi_port  = device_property(dtype=str, default_value="mock://maxi")
 
-    # ============ Attribute (READ/WRITE) ============
-    # Hinweis: Schreib-Attribute ersetzen die früheren Set*-Kommandos.
-
+    # ============ Attribute ============
     # Storage = (V1 && V2)
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
     def Storage(self) -> bool:
@@ -102,44 +101,58 @@ class Vader(Device):
     def GasLeak(self) -> bool:
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
-    # Flows (Sollwerte)
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
-    def FlowButan(self) -> float:
+    # --------- Setpoint-Flows (READ/WRITE) ---------
+    # (Umbenennung der bisherigen Flow* Attribute)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
+    def setpoint_flowButan(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
 
-    def write_FlowButan(self, value: float):
+    def write_setpoint_flowButan(self, value: float):
         self.driver.set_flow_butan(float(value))
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
-    def FlowCO2(self) -> float:
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
+    def setpoint_flowCO2(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
 
-    def write_FlowCO2(self, value: float):
+    def write_setpoint_flowCO2(self, value: float):
         self.driver.set_flow_co2(float(value))
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
-    def FlowN2(self) -> float:
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
+    def setpoint_flowN2(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
 
-    def write_FlowN2(self, value: float):
+    def write_setpoint_flowN2(self, value: float):
         self.driver.set_flow_n2(float(value))
 
-    # Totals (frei setzbar, z. B. Reset=0.0)
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
+    # --------- Ist-Flows (READ) ---------
+    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
+    def flowButan(self) -> float:
+        return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
+
+    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
+    def flowCO2(self) -> float:
+        return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
+
+    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
+    def flowN2(self) -> float:
+        return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
+
+    # Totals (READ/WRITE -> frei setzbar, z. B. Reset=0.0)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
     def TotalCO2(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("total") or 0.0)
 
     def write_TotalCO2(self, value: float):
         self.driver.set_total_co2(float(value))
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
     def TotalN2(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("total") or 0.0)
 
     def write_TotalN2(self, value: float):
         self.driver.set_total_n2(float(value))
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
     def TotalButan(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("total") or 0.0)
 
@@ -147,7 +160,7 @@ class Vader(Device):
         self.driver.set_total_butan(float(value))
 
     # MINI2 / Druck / PWM
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR)
     def setPoint_pressure(self) -> float:
         return float(self.cache_mini2.get("setpoint_kpa") or 0.0)
 
@@ -156,9 +169,7 @@ class Vader(Device):
         self.cache_mini2["setpoint_kpa"] = float(value)
 
     @attribute(
-        dtype=DevLong,
-        access=AttrWriteType.READ_WRITE,
-        dformat=AttrDataFormat.SCALAR,
+        dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
         min_value=0, max_value=255
     )
     def vp1(self) -> int:
@@ -170,9 +181,7 @@ class Vader(Device):
         self.cache_mini2["pwm1"] = v
 
     @attribute(
-        dtype=DevLong,
-        access=AttrWriteType.READ_WRITE,
-        dformat=AttrDataFormat.SCALAR,
+        dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
         min_value=0, max_value=255
     )
     def vp2(self) -> int:
@@ -182,6 +191,12 @@ class Vader(Device):
         v = max(0, min(255, int(value)))
         self.driver.set_manual_PWM_out(v)
         self.cache_mini2["pwm2"] = v
+
+    # Aktueller Druck aus MINI1
+    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
+    def pressure(self) -> float:
+        p = self.cache_mini1.get("pressure")
+        return float("nan") if p is None else float(p)
 
     # ============ Programmsteuerung ============
     @command(dtype_in=str)
@@ -295,15 +310,18 @@ class Vader(Device):
             try:
                 self.driver.maxi_request_status()
                 status = self.driver.maxi_get_status()
+                # io
                 io = status.get("io") or {}
                 for k in ("V1", "V2", "FanIn", "FanOut", "GasLeak"):
                     if k in io:
                         self.cache_maxi["io"][k] = bool(io[k])
+                # mfc
                 mfc = status.get("mfc") or {}
                 for gas in ("butan", "co2", "n2"):
                     mg = mfc.get(gas) or {}
                     self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
                     self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
+                # adc (optional)
                 adc = status.get("adc") or {}
                 self.cache_maxi["adc"]["P11"] = adc.get("P11")
                 self.cache_maxi["adc"]["P31"] = adc.get("P31")
@@ -371,6 +389,7 @@ class Vader(Device):
                 self.set_status(f"[{idx}/{n}] Schrittfehler: {e} – weiter")
 
         self.set_status("Programm abgeschlossen.")
+
 
 # ---- main ----
 if __name__ == "__main__":
