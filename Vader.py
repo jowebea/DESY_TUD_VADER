@@ -362,4 +362,4 @@ class Vader(Device):
 
 # ---- main ----
 if __name__ == "__main__":
-    run((VaderDS,))
+    run((Vader,))
