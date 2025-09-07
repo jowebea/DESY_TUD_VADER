@@ -46,10 +46,14 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
 
 
 class VaderDS(Device):
+    #VaderDeviceDriver("mock://mini1", "mock://mini2", "mock://maxi")
     # ============ Geräteeigenschaften (im Tango-DB konfigurierbar) ============
-    mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
-    mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
-    maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
+    mini1_port = device_property(dtype=str, default_value="mock://mini1")
+    # mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
+    mini2_port = device_property(dtype=str, default_value="mock://mini2")
+    # mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
+    maxi_port  = device_property(dtype=str, default_value="mock://maxi")
+    # maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
 
     # ============ Attribute (lesen/schreiben) ============
     # Schalt-/Status-Attribute
