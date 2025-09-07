@@ -45,7 +45,7 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
     return program
 
 
-class VaderDS(Device):
+class Vader(Device):
     #VaderDeviceDriver("mock://mini1", "mock://mini2", "mock://maxi")
     # ============ Geräteeigenschaften (im Tango-DB konfigurierbar) ============
     mini1_port = device_property(dtype=str, default_value="mock://mini1")
