@@ -1,436 +1,361 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, os, csv, json, time, threading, traceback
-import PyTango as tango
+import json
+import threading
+import time
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Union
 
-# === Importiere deinen Driver ===
-import VaderDeviceDriver  # ggf. Pfad anpassen
+# === pyTango ===
+from tango import DevState
+from tango.server import Device, attribute, command, run, device_property
 
-# ====== Hilfsfunktionen ======
-def now_ts():
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+# === Treiber (ANPASSEN!) ===
+# Beispiel: from drivers.vader_driver import VaderDeviceDriver
+from your_driver_module import VaderDeviceDriver  # <-- ANPASSEN!
 
-# ====== Tango Device ======
-class Vader(tango.Device_4Impl):
+
+# ---------------- JSON-Programm lesen ----------------
+def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
     """
-    Tango-Device für das VADER-System.
-    Bildet Drücke, Ventilzustände, Gasflüsse, Leck und Setpoint ab.
-    Führt CSV-Programme aus und loggt kontinuierlich (default: 5 ms).
+    Erwartet z.B.:
+      [{"type":"Normal","target_pressure":120},
+       {"type":"Ramp","start_pressure":0,"end_pressure":120,"ramp_speed":50},
+       {"type":"delay","delay_time":5000}]
     """
+    with open(filename, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    program = []
+    for i, step in enumerate(data):
+        t = step.get("type")
+        if t == "Normal":
+            program.append({"type": "Normal", "target_pressure": int(step["target_pressure"])})
+        elif t == "Ramp":
+            program.append({
+                "type": "Ramp",
+                "start_pressure": int(step["start_pressure"]),
+                "end_pressure":   int(step["end_pressure"]),
+                "ramp_speed":     float(step["ramp_speed"]),
+            })
+        elif t == "delay":
+            program.append({"type": "delay", "delay_time": int(step["delay_time"])})
+        else:
+            raise ValueError(f"Unbekannter Step-Typ in JSON an Position {i}: {t}")
+    return program
 
-    def __init__(self, cl, name):
-        tango.Device_4Impl.__init__(self, cl, name)
-        self._drv = None
-        self._status = {}
-        self._status_ts = 0.0
-        self._status_lock = threading.Lock()
-        self._log_thread = None
-        self._log_stop = threading.Event()
-        self._prog_thread = None
-        self._prog_stop = threading.Event()
-        Vader.init_device(self)
 
-    # ---------- Lifecycle ----------
+class VaderDS(Device):
+    # ============ Geräteeigenschaften (im Tango-DB konfigurierbar) ============
+    mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
+    mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
+    maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
+
+    # ============ Attribute (lesen/schreiben) ============
+    # Schalt-/Status-Attribute
+    @attribute(dtype=bool)    # Storage = (V1 && V2) als Anzeige
+    def Storage(self) -> bool:
+        return bool(self.cache_maxi["io"].get("V1")) and bool(self.cache_maxi["io"].get("V2"))
+
+    @attribute(dtype=bool)    # Einzelne schaltbare/anzeigbare States
+    def V1(self) -> bool: return bool(self.cache_maxi["io"].get("V1"))
+    @attribute(dtype=bool)
+    def V2(self) -> bool: return bool(self.cache_maxi["io"].get("V2"))
+    @attribute(dtype=bool)
+    def V3(self) -> bool: return bool(self.cache_maxi["io"].get("V3", False))  # V3-Flag aus MAXI-Status (wir führen mit)
+    @attribute(dtype=bool)
+    def Fans(self) -> bool:
+        return bool(self.cache_maxi["io"].get("FanIn")) and bool(self.cache_maxi["io"].get("FanOut"))
+
+    @attribute(dtype=bool)
+    def GasLeak(self) -> bool:
+        return bool(self.cache_maxi["io"].get("GasLeak", False))
+
+    # Flows (l/min o.ä., SI – Treiber skaliert)
+    @attribute(dtype=float)
+    def FlowButan(self) -> float: return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
+
+    @attribute(dtype=float)
+    def FlowCO2(self) -> float:   return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
+
+    @attribute(dtype=float)
+    def FlowN2(self) -> float:    return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
+
+    # Totals (z.B. in gleichen Einheiten × Zeit; Treiber de-skaliert)
+    @attribute(dtype=float)
+    def TotalCO2(self) -> float:  return float(self.cache_maxi["mfc"]["co2"].get("total") or 0.0)
+
+    @attribute(dtype=float)
+    def TotalN2(self) -> float:   return float(self.cache_maxi["mfc"]["n2"].get("total") or 0.0)
+
+    @attribute(dtype=float)
+    def TotalButan(self) -> float: return float(self.cache_maxi["mfc"]["butan"].get("total") or 0.0)
+
+    # MINI2 / Druck / PWM
+    @attribute(dtype=float)  # zuletzt gesetzter Soll-Druck (wir cachen)
+    def setPoint_pressure(self) -> float: return float(self.cache_mini2.get("setpoint_kpa") or 0.0)
+
+    @attribute(dtype=int)    # vp1 (PWM_in)
+    def vp1(self) -> int: return int(self.cache_mini2.get("pwm1") or 0)
+
+    @attribute(dtype=int)    # vp2 (PWM_out)
+    def vp2(self) -> int: return int(self.cache_mini2.get("pwm2") or 0)
+
+    # ============ Schreib-Attribute (optional via Commands; hier read-only) ============
+    # (Du wolltest "manuelles Setzen" als Funktionen/Kommandos – daher sind die Attribute selbst read-only.)
+
+    # ============ Kommandos (manuelles Setzen) ============
+    @command(dtype_in=bool)
+    def SetStorage(self, open_: bool):
+        """V1 und V2 gemeinsam setzen."""
+        self.driver.set_v1(open_)
+        self.driver.set_v2(open_)
+        # lokalen Flags gleich aktualisieren
+        self.cache_maxi["io"]["V1"] = bool(open_)
+        self.cache_maxi["io"]["V2"] = bool(open_)
+
+    @command(dtype_in=bool)
+    def SetV3(self, open_: bool):
+        self.driver.set_v3(open_)
+        self.cache_maxi["io"]["V3"] = bool(open_)
+
+    @command(dtype_in=bool)
+    def SetFans(self, on: bool):
+        """Beide Lüfter (FanIn & FanOut) gemeinsam."""
+        self.driver.set_fans(on)
+        self.cache_maxi["io"]["FanIn"]  = bool(on)
+        self.cache_maxi["io"]["FanOut"] = bool(on)
+
+    @command(dtype_in=float)
+    def SetFlowButan(self, flow: float):
+        self.driver.set_flow_butan(flow)
+
+    @command(dtype_in=float)
+    def SetFlowCO2(self, flow: float):
+        self.driver.set_flow_co2(flow)
+
+    @command(dtype_in=float)
+    def SetFlowN2(self, flow: float):
+        self.driver.set_flow_n2(flow)
+
+    @command(dtype_in=float)
+    def SetTotalCO2(self, value: float):
+        self.driver.set_total_co2(value)
+
+    @command(dtype_in=float)
+    def SetTotalN2(self, value: float):
+        self.driver.set_total_n2(value)
+
+    @command(dtype_in=float)
+    def SetTotalButan(self, value: float):
+        self.driver.set_total_butan(value)
+
+    @command(dtype_in=float)
+    def SetSetPointPressure(self, kpa: float):
+        self.driver.setpoint_pressure(kpa)
+        self.cache_mini2["setpoint_kpa"] = float(kpa)
+
+    @command(dtype_in=int)
+    def SetVP1(self, value: int):
+        self.driver.set_manual_PWM_in(int(value))
+        self.cache_mini2["pwm1"] = int(value)
+
+    @command(dtype_in=int)
+    def SetVP2(self, value: int):
+        self.driver.set_manual_PWM_out(int(value))
+        self.cache_mini2["pwm2"] = int(value)
+
+    # ============ Programmsteuerung ============
+    @command(dtype_in=str)
+    def RunProgram(self, json_path: str):
+        """JSON-Programm asynchron starten. Bereits laufendes Programm wird abgebrochen."""
+        self.StopProgram()
+        self._program_stop_evt.clear()
+        self._program_thread = threading.Thread(
+            target=self._program_worker, args=(json_path,), daemon=True
+        )
+        self._program_thread.start()
+
+    @command()
+    def StopProgram(self):
+        """Laufendes Programm stoppen (best effort)."""
+        self._program_stop_evt.set()
+        if self._program_thread and self._program_thread.is_alive():
+            # kurz warten, dann Referenz lösen
+            self._program_thread.join(timeout=0.1)
+        self._program_thread = None
+
+    # ============ Lifecycle ============
     def init_device(self):
-        self.get_device_properties(self.get_device_class())
-        self.set_state(tango.DevState.INIT)
-        try:
-            self._drv = VaderDeviceDriver(
-                self.Mini1Port, self.Mini2Port, self.MaxiPort, self.Mini1MaxSamples
-            )
-            self._ensure_log_dir()
-            # Logger ggf. auto-start
-            if self.LoggingEnabled:
-                self._start_logger()
-            self.set_state(tango.DevState.ON)
-            self.set_status("Connected.")
-        except Exception as e:
-            self.set_state(tango.DevState.FAULT)
-            self.set_status(f"Init failed: {e}\n{traceback.format_exc()}")
+        Device.init_device(self)
+
+        self.set_state(DevState.INIT)
+        self.set_status("Initialisiere Treiber...")
+
+        # Treiber
+        self.driver = VaderDeviceDriver(
+            mini1_port=self.mini1_port,
+            mini2_port=self.mini2_port,
+            maxi_port=self.maxi_port
+        )
+
+        # Caches (werden durch Poller befüllt)
+        self.cache_maxi: Dict[str, Any] = {
+            "io": {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False},
+            "mfc": {"butan": {"flow": 0.0, "total": 0.0},
+                    "co2":   {"flow": 0.0, "total": 0.0},
+                    "n2":    {"flow": 0.0, "total": 0.0}},
+            "adc": {"P11": None, "P31": None},
+            "ts": 0.0,
+        }
+        self.cache_mini2: Dict[str, Any] = {
+            "setpoint_kpa": 0.0, "pwm1": 0, "pwm2": 0,
+            "mode": "UNKNOWN", "p20_kpa": None, "p21_kpa": None, "ts": 0.0
+        }
+        self.cache_mini1: Dict[str, Any] = {"pressure": None, "ts": 0.0}
+
+        # Programm-Thread
+        self._program_thread: Optional[threading.Thread] = None
+        self._program_stop_evt = threading.Event()
+
+        # Poller-Threads (MINI1: 20 Hz; MINI2: 0.5 Hz; MAXI: 0.5 Hz)
+        self._stop_evt = threading.Event()
+        self._t_mini1 = threading.Thread(target=self._poll_mini1, daemon=True)
+        self._t_mini2 = threading.Thread(target=self._poll_mini2, daemon=True)
+        self._t_maxi  = threading.Thread(target=self._poll_maxi,  daemon=True)
+        self._t_mini1.start()
+        self._t_mini2.start()
+        self._t_maxi.start()
+
+        self.set_state(DevState.ON)
+        self.set_status("Bereit.")
 
     def delete_device(self):
+        self.StopProgram()
+        self._stop_evt.set()
+        # Threads beenden
+        for t in (self._t_mini1, self._t_mini2, self._t_maxi):
+            if t and t.is_alive():
+                t.join(timeout=0.2)
+        # Treiber schließen
         try:
-            self._stop_logger()
+            self.driver.close()
         except Exception:
             pass
-        try:
-            if self._drv: self._drv.close()
-        except Exception:
-            pass
+        self.set_state(DevState.OFF)
+        self.set_status("Gestoppt.")
 
-    # ---------- Status/Cache ----------
-    def _refresh_status(self, max_age=0.05):
-        with self._status_lock:
-            now = time.time()
-            if (now - self._status_ts) < max_age and self._status:
-                return self._status
+    # ============ Poller ============
+    def _poll_mini1(self):
+        """20 Hz: MINI1 (Druck)"""
+        period = 1.0 / 20.0
+        while not self._stop_evt.is_set():
             try:
-                # Triggert die Geräte-Statusantworten (Treiber liest asynchron)
-                self._drv.mini2.request_status()
-                self._drv.maxi.request_status()
-                time.sleep(0.01)
-                self._status = self._drv.get_all_status(mini1_last_n=1)
-                self._status_ts = now
-                self.set_state(tango.DevState.ON)
-                self.set_status("OK")
-            except Exception as e:
-                self.set_state(tango.DevState.ALARM)
-                self.set_status(f"Read error: {e}")
-            return self._status
+                p = self.driver.mini1.pressure
+                self.cache_mini1["pressure"] = p
+                self.cache_mini1["ts"] = time.time()
+            except Exception:
+                pass
+            time.sleep(period)
 
-    def _g(self, default=None, *path):
-        d = self._status
-        for p in path:
-            if isinstance(d, dict) and p in d: d = d[p]
-            else: return default
-        return d
+    def _poll_mini2(self):
+        """0.5 Hz: MINI2 Status (PWM/Mode/Setpoint)"""
+        period = 2.0
+        while not self._stop_evt.is_set():
+            try:
+                self.driver.mini2_request_status()
+                status = self.driver.mini2_get_status()  # dict
+                # bekannte Felder übernehmen
+                self.cache_mini2["pwm1"] = int(status.get("pwm1") or 0)
+                self.cache_mini2["pwm2"] = int(status.get("pwm2") or 0)
+                self.cache_mini2["mode"] = status.get("mode") or "UNKNOWN"
+                # setpoint ist nicht im Status – wir halten den letzten gesetzten Wert im Cache
+                # optional: aus Druckfeldern (p20/p21) könnte man "pressure_kpa" übernehmen
+                self.cache_mini2["ts"] = time.time()
+            except Exception:
+                pass
+            time.sleep(period)
 
-    # ---------- Logger ----------
-    def _ensure_log_dir(self):
-        if not self.LogDirectory:
-            self.LogDirectory = "/tmp"
-        os.makedirs(self.LogDirectory, exist_ok=True)
+    def _poll_maxi(self):
+        """0.5 Hz: MAXI Status (Ventile/Lüfter/Flows/Totals/GasLeak)"""
+        period = 2.0
+        while not self._stop_evt.is_set():
+            try:
+                self.driver.maxi_request_status()
+                status = self.driver.maxi_get_status()  # dict {"io":...,"mfc":...,"adc":...}
+                # io
+                io = status.get("io") or {}
+                for k in ("V1", "V2", "FanIn", "FanOut", "GasLeak"):
+                    if k in io:
+                        self.cache_maxi["io"][k] = bool(io[k])
+                # (V3 ist in MAXI-Status nicht explizit – wir führen es lokal nach SetV3)
+                # mfc
+                mfc = status.get("mfc") or {}
+                for gas in ("butan", "co2", "n2"):
+                    mg = mfc.get(gas) or {}
+                    self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
+                    self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
+                # adc (optional)
+                adc = status.get("adc") or {}
+                self.cache_maxi["adc"]["P11"] = adc.get("P11")
+                self.cache_maxi["adc"]["P31"] = adc.get("P31")
+                self.cache_maxi["ts"] = time.time()
+            except Exception:
+                pass
+            time.sleep(period)
 
-    def _start_logger(self):
-        if self._log_thread and self._log_thread.is_alive():
+    # ============ Programm-Worker ============
+    def _program_worker(self, json_path: str):
+        """Führt das JSON-Programm aus; bricht ab, wenn Stop gesetzt wird."""
+        try:
+            prog = read_program_from_json(json_path)
+        except Exception as e:
+            self.set_status(f"Programm-Fehler: {e}")
             return
-        self._log_stop.clear()
-        fname = os.path.join(
-            self.LogDirectory, time.strftime("vader_%Y%m%d_%H%M%S.csv")
-        )
-        period_s = max(1, int(self.LoggingPeriodMs)) / 1000.0
-
-        def run():
-            # Header
-            fields = [
-                "timestamp",
-                "mini1_pressure_kpa","mini1_p21_kpa","mini1_p20_kpa",
-                "mini2_setpoint_kpa","mini2_pressure_kpa","mini2_mode",
-                "p11_kpa","p31_kpa",
-                "v1","v2","v3","v4","fan_in","fan_out","vs3","heater_pwm",
-                "vp1_pwm","vp2_pwm",
-                "mfc_butan_set","mfc_n2_set","mfc_co2_set",
-                "mfc_butan_flow","mfc_n2_flow","mfc_co2_flow",
-                "leak_sensor"
-            ]
-            with open(fname, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=fields)
-                w.writeheader()
-                next_t = time.perf_counter()
-                while not self._log_stop.is_set():
-                    try:
-                        st = self._refresh_status(max_age=0.0)
-                        mx = st.get("maxi", {})
-                        m2 = st.get("mini2", {})
-                        row = {
-                            "timestamp": now_ts(),
-                            "mini1_pressure_kpa": st.get("mini1", {}).get("latest_combined_pressure"),
-                            "mini1_p21_kpa": m2.get("p21_kpa"),
-                            "mini1_p20_kpa": m2.get("p20_kpa"),
-                            "mini2_setpoint_kpa": m2.get("setpoint_kpa"),
-                            "mini2_pressure_kpa": m2.get("pressure_kpa"),
-                            "mini2_mode": "MANUAL" if m2.get("pwm1") is not None and m2.get("pwm2") is not None and m2.get("kp") is not None and m2.get("leak_sensor") is not None and (m2.get("setpoint_index") is not None) and (m2.get("setpoint_kpa") is not None) and (m2.get("pressure_kpa") is not None) and False else ("AUTO" if True else "UNKNOWN"),
-                            "p11_kpa": mx.get("p11"),
-                            "p31_kpa": mx.get("p31"),
-                            "v1": mx.get("v1_power"),
-                            "v2": mx.get("v2_power"),
-                            "v3": mx.get("v3_power"),
-                            "v4": mx.get("v4_power"),
-                            "fan_in": mx.get("fan_in_power"),
-                            "fan_out": mx.get("fan_out_power"),
-                            "vs3": mx.get("vs3_power"),
-                            "heater_pwm": mx.get("heater_pwm"),
-                            "vp1_pwm": m2.get("pwm1"),
-                            "vp2_pwm": m2.get("pwm2"),
-                            "mfc_butan_set":  (mx.get("mfc_butan",{}) or {}).get("setpoint"),
-                            "mfc_n2_set":     (mx.get("mfc_n2",{}) or {}).get("setpoint"),
-                            "mfc_co2_set":    (mx.get("mfc_co2",{}) or {}).get("setpoint"),
-                            "mfc_butan_flow": (mx.get("mfc_butan",{}) or {}).get("flow"),
-                            "mfc_n2_flow":    (mx.get("mfc_n2",{}) or {}).get("flow"),
-                            "mfc_co2_flow":   (mx.get("mfc_co2",{}) or {}).get("flow"),
-                            "leak_sensor": mx.get("leak_sensor"),
-                        }
-                        w.writerow(row)
-                    except Exception:
-                        pass
-                    next_t += period_s
-                    sleep = next_t - time.perf_counter()
-                    if sleep > 0: time.sleep(sleep)
-
-        self._log_thread = threading.Thread(target=run, daemon=True)
-        self._log_thread.start()
-        self.set_status(f"Logging to {fname} every {self.LoggingPeriodMs} ms")
-
-    def _stop_logger(self):
-        self._log_stop.set()
-        if self._log_thread:
-            self._log_thread.join(timeout=1.0)
-        self._log_thread = None
-
-    # ---------- CSV-Programm ----------
-    def _run_program(self, path: str):
-        self._prog_stop.clear()
-        with open(path, newline="") as f:
-            rdr = csv.DictReader(f)
-            # erlaubte Headernamen
-            cols = {c.lower(): c for c in rdr.fieldnames or []}
-            required = ["haltezeit_ms","druck_kpa","butan_nlmin","n2_nlmin","co2_nlmin"]
-            for r in required:
-                if r not in cols:
-                    raise tango.DevFailed(f"CSV fehlt Spalte: {r}")
-            for row in rdr:
-                if self._prog_stop.is_set(): break
-                try:
-                    hold_ms = float(row[cols["haltezeit_ms"]])
-                    p_kpa   = float(row[cols["druck_kpa"]])
-                    butan   = float(row[cols["butan_nlmin"]])
-                    n2      = float(row[cols["n2_nlmin"]])
-                    co2     = float(row[cols["co2_nlmin"]])
-                except Exception as e:
-                    raise tango.DevFailed(f"CSV Parsefehler: {e}")
-
-                # Zielwerte setzen
-                self._drv.setpoint_pressure(p_kpa)
-                self._drv.maxi.set_flow_butan(butan)
-                self._drv.maxi.set_flow_n2(n2)
-                self._drv.maxi.set_flow_co2(co2)
-
-                # Haltezeit abwarten (in kleinen Schritten, damit Stop greift)
-                t_end = time.perf_counter() + max(0.0, hold_ms)/1000.0
-                while not self._prog_stop.is_set() and time.perf_counter() < t_end:
-                    time.sleep(0.01)
-
-    # =================== Attribute ===================
-    # Probenvolumen
-    def read_Mini1Pressure(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("mini1",{}).get("latest_combined_pressure") or float("nan")))
-
-    def read_P21(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("mini2",{}).get("p21_kpa") or float("nan")))
-
-    def read_P20(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("mini2",{}).get("p20_kpa") or float("nan")))
-
-    # High/Low Pressure Volumes
-    def read_P11(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("maxi",{}).get("p11") or float("nan")))
-
-    def read_P31(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("maxi",{}).get("p31") or float("nan")))
-
-    # Setpoint
-    def read_SetpointKpa(self, attr):
-        st = self._refresh_status()
-        attr.set_value(float(st.get("mini2",{}).get("setpoint_kpa") or float("nan")))
-
-    def write_SetpointKpa(self, attr):
-        self._drv.setpoint_pressure(float(attr.get_write_value()))
-        self._refresh_status(max_age=0.0)
-
-    # Gas Leak
-    def read_GasLeak(self, attr):
-        st = self._refresh_status()
-        val = st.get("maxi",{}).get("leak_sensor")
-        attr.set_value(int(val if isinstance(val,int) else 0))
-
-    # Ventilzustände (MAXI)
-    def _read_sw(self, key):
-        st = self._refresh_status()
-        v = st.get("maxi",{}).get(key)
-        if isinstance(v,str): return v.upper()=="ON"
-        if isinstance(v,(int,float)): return int(v)!=0
-        return False
-
-    def _write_valve(self, addr_name, on):
-        address = {
-            "v1_power":1,"v2_power":2,"v3_power":3,"v4_power":4,
-            "fan_in_power":8,"fan_out_power":9,"vs3_power":12
-        }[addr_name]
-        if addr_name.startswith("v"):
-            self._drv.maxi.set_valve(address, bool(on))
-        else:
-            self._drv.maxi.set_component(address, 1 if on else 0)
-        self._refresh_status(max_age=0.0)
-
-    def read_V1(self, attr): attr.set_value(self._read_sw("v1_power"))
-    def write_V1(self, attr): self._write_valve("v1_power", attr.get_write_value())
-    def read_V2(self, attr): attr.set_value(self._read_sw("v2_power"))
-    def write_V2(self, attr): self._write_valve("v2_power", attr.get_write_value())
-    def read_V3(self, attr): attr.set_value(self._read_sw("v3_power"))
-    def write_V3(self, attr): self._write_valve("v3_power", attr.get_write_value())
-    def read_V4(self, attr): attr.set_value(self._read_sw("v4_power"))
-    def write_V4(self, attr): self._write_valve("v4_power", attr.get_write_value())
-    def read_FanIn(self, attr): attr.set_value(self._read_sw("fan_in_power"))
-    def write_FanIn(self, attr): self._write_valve("fan_in_power", attr.get_write_value())
-    def read_FanOut(self, attr): attr.set_value(self._read_sw("fan_out_power"))
-    def write_FanOut(self, attr): self._write_valve("fan_out_power", attr.get_write_value())
-    def read_VS3(self, attr): attr.set_value(self._read_sw("vs3_power"))
-    def write_VS3(self, attr): self._write_valve("vs3_power", attr.get_write_value())
-
-    # vp1/vp2 & Mode (MINI2)
-    def read_vp1PWM(self, attr):
-        st = self._refresh_status(); attr.set_value(int(st.get("mini2",{}).get("pwm1") or 0))
-    def write_vp1PWM(self, attr):
-        self._drv.mini2.set_manual_vp1(int(attr.get_write_value())); self._refresh_status(max_age=0.0)
-    def read_vp2PWM(self, attr):
-        st = self._refresh_status(); attr.set_value(int(st.get("mini2",{}).get("pwm2") or 0))
-    def write_vp2PWM(self, attr):
-        self._drv.mini2.set_manual_vp2(int(attr.get_write_value())); self._refresh_status(max_age=0.0)
-    def read_Mini2Mode(self, attr):
-        # 0=Auto, 1=Manual (wir lesen das nicht direkt -> heuristisch via PWM write erlaubt)
-        # Für Klarheit expose ich einen String: "AUTO"/"MANUAL"
-        attr.set_value("AUTO")  # wenn du den Zustand aus ADR_STATE bekommst, hier umsetzen
-
-    # Flüsse
-    def read_FlowButan(self, attr):
-        st=self._refresh_status(); attr.set_value(float((st.get("maxi",{}).get("mfc_butan",{}) or {}).get("setpoint") or 0.0))
-    def write_FlowButan(self, attr):
-        self._drv.maxi.set_flow_butan(float(attr.get_write_value())); self._refresh_status(max_age=0.0)
-    def read_FlowN2(self, attr):
-        st=self._refresh_status(); attr.set_value(float((st.get("maxi",{}).get("mfc_n2",{}) or {}).get("setpoint") or 0.0))
-    def write_FlowN2(self, attr):
-        self._drv.maxi.set_flow_n2(float(attr.get_write_value())); self._refresh_status(max_age=0.0)
-    def read_FlowCO2(self, attr):
-        st=self._refresh_status(); attr.set_value(float((st.get("maxi",{}).get("mfc_co2",{}) or {}).get("setpoint") or 0.0))
-    def write_FlowCO2(self, attr):
-        self._drv.maxi.set_flow_co2(float(attr.get_write_value())); self._refresh_status(max_age=0.0)
-
-    # =================== Commands ===================
-    def GetStatus(self):
-        self._refresh_status(max_age=0.0)
-        return json.dumps(self._status, default=str)
-
-    def StorageVolume(self, open_):
-        """V1+V2 gemeinsam schalten (Probenvolumen <-> High Pressure Volume)."""
-        self._drv.storage_volume(bool(open_)); self._refresh_status(max_age=0.0)
-
-    def ActivateVac(self, enable):
-        """Vakuumpumpe (V4) ein/aus."""
-        self._drv.activate_vac(bool(enable)); self._refresh_status(max_age=0.0)
-
-    def PurgeHighPressure(self):
-        """
-        Gaswechsel im High-Pressure Volume:
-        1) MFCs schließen, V1/V2 schließen.
-        2) V3 öffnen (Verbindung zu Vakuum 1)
-        3) 3 s warten, damit sich der Gasstrom einstellt.
-        """
-        # MFCs zu
-        self._drv.maxi.set_flow_butan(0.0)
-        self._drv.maxi.set_flow_n2(0.0)
-        self._drv.maxi.set_flow_co2(0.0)
-        # V1/V2 zu
-        self._drv.maxi.set_valve(1, False); self._drv.maxi.set_valve(2, False)
-        # V3 auf, 3 s warten
-        self._drv.maxi.set_valve(3, True)
-        time.sleep(3.0)
-        # V3 wieder zu
-        self._drv.maxi.set_valve(3, False)
-        self._refresh_status(max_age=0.0)
-
-    def RunProgramFile(self, path):
-        """CSV mit Spalten: Haltezeit_ms, Druck_kPa, Butan_nlmin, N2_nlmin, CO2_nlmin"""
-        if self._prog_thread and self._prog_thread.is_alive():
-            raise tango.DevFailed("Programm läuft bereits")
-        self._prog_stop.clear()
-        def th():
+        self.set_status(f"Programm gestartet: {json_path} ({len(prog)} Schritte)")
+        for step in prog:
+            if self._program_stop_evt.is_set():
+                self.set_status("Programm abgebrochen.")
+                return
+            t = step["type"]
             try:
-                self._run_program(path)
-                self.set_status("Programm fertig")
+                if t == "Normal":
+                    target = float(step["target_pressure"])
+                    self.driver.setpoint_pressure(target)
+                    self.cache_mini2["setpoint_kpa"] = target
+
+                elif t == "Ramp":
+                    start_p = float(step["start_pressure"])
+                    end_p   = float(step["end_pressure"])
+                    speed   = float(step["ramp_speed"])  # kPa/s
+                    # Startdruck kurz anfahren
+                    self.driver.setpoint_pressure(start_p)
+                    time.sleep(0.2)
+                    # Rampe setzen
+                    self.driver.set_ramp(speed_kpa_s=speed, end_kpa=end_p)
+                    # Optionale grobe Dauer warten (mit Abbruchprüfung)
+                    approx = abs(end_p - start_p) / max(1e-6, speed)
+                    t_end = time.time() + min(approx, 3600)
+                    while time.time() < t_end:
+                        if self._program_stop_evt.is_set():
+                            break
+                        time.sleep(0.1)
+
+                elif t == "delay":
+                    ms = int(step["delay_time"])
+                    t_end = time.time() + ms / 1000.0
+                    while time.time() < t_end:
+                        if self._program_stop_evt.is_set():
+                            break
+                        time.sleep(0.05)
+
             except Exception as e:
-                self.set_state(tango.DevState.FAULT)
-                self.set_status(f"Programmfehler: {e}")
-        self._prog_thread = threading.Thread(target=th, daemon=True)
-        self._prog_thread.start()
-        self.set_status(f"Programm gestartet: {path}")
+                self.set_status(f"Programm-Schrittfehler: {e}")
+                # weiter zum nächsten Schritt
+                continue
 
-    def StopProgram(self):
-        self._prog_stop.set()
+        self.set_status("Programm abgeschlossen.")
 
-    def SetLogging(self, enabled):
-        if enabled:
-            self._start_logger()
-        else:
-            self._stop_logger()
-
-    def SetLoggingPeriodMs(self, period_ms):
-        self.LoggingPeriodMs = int(period_ms)
-        if self._log_thread and self._log_thread.is_alive():
-            # Neustarten, damit neue Periode greift
-            self._stop_logger(); self._start_logger()
-
-# ====== DeviceClass ======
-class VaderClass(tango.DeviceClass):
-    # Device Properties
-    device_property_list = {
-        "Mini1Port":      [tango.DevString, "Serial port MINI1", []],
-        "Mini2Port":      [tango.DevString, "Serial port MINI2", []],
-        "MaxiPort":       [tango.DevString, "Serial port MAXI",  []],
-        "Mini1MaxSamples":[tango.DevLong,   "Ringpuffer MINI1",  [300000]],
-        "LoggingEnabled": [tango.DevBoolean,"Logger Autostart",  [True]],
-        "LoggingPeriodMs":[tango.DevLong,   "Logger Periode ms", [5]],
-        "LogDirectory":   [tango.DevString, "Log-Verzeichnis",   ["/tmp"]],
-    }
-
-    # Commands
-    cmd_list = {
-        "GetStatus":       [[tango.DevVoid],[tango.DevString]],
-        "StorageVolume":   [[tango.DevBoolean],[tango.DevVoid]],
-        "ActivateVac":     [[tango.DevBoolean],[tango.DevVoid]],
-        "PurgeHighPressure":[[tango.DevVoid],[tango.DevVoid]],
-        "RunProgramFile":  [[tango.DevString],[tango.DevVoid]],
-        "StopProgram":     [[tango.DevVoid],[tango.DevVoid]],
-        "SetLogging":      [[tango.DevBoolean],[tango.DevVoid]],
-        "SetLoggingPeriodMs": [[tango.DevLong],[tango.DevVoid]],
-    }
-
-    # Attributes
-    attr_list = {
-        # Drücke Probenvolumen
-        "Mini1Pressure": [[tango.DevDouble, tango.SCALAR, tango.READ]],
-        "P21":           [[tango.DevDouble, tango.SCALAR, tango.READ]],
-        "P20":           [[tango.DevDouble, tango.SCALAR, tango.READ]],
-        # High-/Low-Pressure Volumes
-        "P11":           [[tango.DevDouble, tango.SCALAR, tango.READ]],
-        "P31":           [[tango.DevDouble, tango.SCALAR, tango.READ]],
-        # Setpoint/Leak
-        "SetpointKpa":   [[tango.DevDouble, tango.SCALAR, tango.READ_WRITE]],
-        "GasLeak":       [[tango.DevLong,   tango.SCALAR, tango.READ]],
-        # Ventile MAXI
-        "V1":            [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "V2":            [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "V3":            [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "V4":            [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "FanIn":         [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "FanOut":        [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        "VS3":           [[tango.DevBoolean, tango.SCALAR, tango.READ_WRITE]],
-        # MINI2 Ventile (PWM) + Modus
-        "vp1PWM":        [[tango.DevLong,    tango.SCALAR, tango.READ_WRITE]],
-        "vp2PWM":        [[tango.DevLong,    tango.SCALAR, tango.READ_WRITE]],
-        "Mini2Mode":     [[tango.DevString,  tango.SCALAR, tango.READ]],
-        # MFC-Flüsse (Soll)
-        "FlowButan":     [[tango.DevDouble, tango.SCALAR, tango.READ_WRITE]],
-        "FlowN2":        [[tango.DevDouble, tango.SCALAR, tango.READ_WRITE]],
-        "FlowCO2":       [[tango.DevDouble, tango.SCALAR, tango.READ_WRITE]],
-    }
-
-# ====== main ======
-def main():
-    try:
-        util = tango.Util(sys.argv)
-        util.add_class(VaderClass, Vader, "Vader")
-        util.server_init()
-        util.server_run()
-    except tango.DevFailed as e:
-        print("DevFailed:", e)
-    except Exception as e:
-        print("Exception:", e)
-
+# ---- main ----
 if __name__ == "__main__":
-    main()
+    run((VaderDS,))
