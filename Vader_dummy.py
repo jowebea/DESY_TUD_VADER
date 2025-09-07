@@ -1,356 +1,208 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
-import math
-import random
-import threading
-import time
-from typing import Dict, Any, List
-
-from tango import DevState
-from tango.server import Device, attribute, command, run, device_property
+import sys, time, json, threading, random
+import PyTango as tango
 
 
-# ---------------- JSON-Programm lesen ----------------
-def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
+# -------- Hilfsfunktion für JSON-Programm --------
+def read_program_from_json(filename):
     with open(filename, "r", encoding="utf-8") as f:
         data = json.load(f)
-    prog = []
-    for i, step in enumerate(data):
-        t = step.get("type")
-        if t == "Normal":
-            prog.append({"type": "Normal", "target_pressure": float(step["target_pressure"])})
-        elif t == "Ramp":
-            prog.append({
-                "type": "Ramp",
-                "start_pressure": float(step["start_pressure"]),
-                "end_pressure":   float(step["end_pressure"]),
-                "ramp_speed":     float(step["ramp_speed"]),
-            })
-        elif t == "delay":
-            prog.append({"type": "delay", "delay_time": int(step["delay_time"])})
-        else:
-            raise ValueError(f"Unbekannter Step-Typ an Pos {i}: {t}")
-    return prog
+    return data
 
 
-class VaderDummyDS(Device):
+# ====================== Device ======================
+class Vader(tango.Device_4Impl):
     """
-    Dummy-Tango-Server zum Testen des Interfaces.
-    Simuliert MINI1/2/MAXI:
-      - Drucksim (20 Hz)
-      - Status/Flows/Totals (0.5 Hz sichtbar)
-      - JSON-Programm (Normal/Ramp/delay)
+    Dummy-Server: bedient sich wie der echte VADER,
+    aber simuliert nur (kein Hardware-Zugriff).
     """
 
-    # „Geräteeigenschaften“ – hier nur Dummies/Startwerte
-    mini1_port = device_property(dtype=str, default_value="DUMMY")
-    mini2_port = device_property(dtype=str, default_value="DUMMY")
-    maxi_port  = device_property(dtype=str, default_value="DUMMY")
+    def __init__(self, cl, name):
+        tango.Device_4Impl.__init__(self, cl, name)
+        self._lock = threading.Lock()
+        # Statusvariablen
+        self._io = {"V1": False, "V2": False, "V3": False, "Fans": False, "GasLeak": False}
+        self._mfc = {"butan": {"flow": 0.0, "total": 0.0},
+                     "co2":   {"flow": 0.0, "total": 0.0},
+                     "n2":    {"flow": 0.0, "total": 0.0}}
+        self._mini1_pressure = 101.3
+        self._setpoint = 0.0
+        self._vp1 = 0
+        self._vp2 = 0
+        self._mode = "IDLE"
+        self._prog_thread = None
+        self._prog_stop = threading.Event()
+        self._stop_evt = threading.Event()
+        self._last_integrate = time.time()
+        Vader.init_device(self)
 
-    # ------------- Attribute (anzeigen) -------------
-    @attribute(dtype=bool)  # Storage als V1 && V2
-    def Storage(self) -> bool:
-        return bool(self._io["V1"] and self._io["V2"])
+    # ---------- Lifecycle ----------
+    def init_device(self):
+        self.set_state(tango.DevState.INIT)
+        try:
+            self._stop_evt.clear()
+            # Simulations-Threads
+            self._t_mini1 = threading.Thread(target=self._loop_mini1, daemon=True)
+            self._t_status = threading.Thread(target=self._loop_status, daemon=True)
+            self._t_mini1.start()
+            self._t_status.start()
+            self.set_state(tango.DevState.ON)
+            self.set_status("Dummy läuft.")
+        except Exception as e:
+            self.set_state(tango.DevState.FAULT)
+            self.set_status(f"Init-Fehler: {e}")
 
-    @attribute(dtype=bool)
-    def V1(self) -> bool:
-        return bool(self._io["V1"])
+    def delete_device(self):
+        self._stop_evt.set()
+        for t in (getattr(self, "_t_mini1", None), getattr(self, "_t_status", None)):
+            if t and t.is_alive():
+                t.join(timeout=0.5)
+        self.set_state(tango.DevState.OFF)
+        self.set_status("Dummy gestoppt.")
 
-    @attribute(dtype=bool)
-    def V2(self) -> bool:
-        return bool(self._io["V2"])
+    # ---------- Simulations-Threads ----------
+    def _loop_mini1(self):
+        """20 Hz Drucksimulation + Flows integrieren"""
+        period = 1/20
+        while not self._stop_evt.is_set():
+            t0 = time.time()
+            with self._lock:
+                dt = t0 - self._last_integrate
+                self._last_integrate = t0
+                # Druck gleicht sich langsam an Setpoint an
+                self._mini1_pressure += (self._setpoint - self._mini1_pressure) * dt/2.0
+                self._mini1_pressure += random.gauss(0, 0.01)
+                # Totalisatoren integrieren
+                for gas in self._mfc.values():
+                    gas["total"] += gas["flow"] * (dt/60.0)
+                # GasLeak: zufällig
+                self._io["GasLeak"] = (random.random() < 0.01)
+            time.sleep(period)
 
-    @attribute(dtype=bool)
-    def V3(self) -> bool:
-        return bool(self._io["V3"])
+    def _loop_status(self):
+        """0.5 Hz: Mini2-Mode ableiten"""
+        while not self._stop_evt.is_set():
+            with self._lock:
+                if abs(self._setpoint - self._mini1_pressure) > 2.0:
+                    self._mode = "AUTOMATIC"
+                elif (self._vp1 + self._vp2) > 0:
+                    self._mode = "MANUAL"
+                else:
+                    self._mode = "IDLE"
+            time.sleep(2.0)
 
-    @attribute(dtype=bool)
-    def Fans(self) -> bool:
-        return bool(self._io["FanIn"] and self._io["FanOut"])
+    # ---------- Attribute ----------
+    def read_Storage(self, attr):
+        with self._lock:
+            attr.set_value(self._io["V1"] and self._io["V2"])
 
-    @attribute(dtype=bool)
-    def GasLeak(self) -> bool:
-        return bool(self._io["GasLeak"])
+    def read_V1(self, attr):  attr.set_value(self._io["V1"])
+    def read_V2(self, attr):  attr.set_value(self._io["V2"])
+    def read_V3(self, attr):  attr.set_value(self._io["V3"])
+    def read_Fans(self, attr): attr.set_value(self._io["Fans"])
+    def read_GasLeak(self, attr): attr.set_value(self._io["GasLeak"])
+    def read_FlowButan(self, attr): attr.set_value(self._mfc["butan"]["flow"])
+    def read_FlowCO2(self, attr): attr.set_value(self._mfc["co2"]["flow"])
+    def read_FlowN2(self, attr): attr.set_value(self._mfc["n2"]["flow"])
+    def read_TotalButan(self, attr): attr.set_value(self._mfc["butan"]["total"])
+    def read_TotalCO2(self, attr): attr.set_value(self._mfc["co2"]["total"])
+    def read_TotalN2(self, attr): attr.set_value(self._mfc["n2"]["total"])
+    def read_setPoint_pressure(self, attr): attr.set_value(self._setpoint)
+    def read_vp1(self, attr): attr.set_value(self._vp1)
+    def read_vp2(self, attr): attr.set_value(self._vp2)
 
-    @attribute(dtype=float)
-    def FlowButan(self) -> float:
-        return float(self._mfc["butan"]["flow"])
+    # ---------- Commands ----------
+    def SetStorage(self, open_):  self._io["V1"] = self._io["V2"] = bool(open_)
+    def SetV3(self, open_):       self._io["V3"] = bool(open_)
+    def SetFans(self, on):        self._io["Fans"] = bool(on)
+    def SetFlowButan(self, flow): self._mfc["butan"]["flow"] = max(0.0, flow)
+    def SetFlowCO2(self, flow):   self._mfc["co2"]["flow"]   = max(0.0, flow)
+    def SetFlowN2(self, flow):    self._mfc["n2"]["flow"]    = max(0.0, flow)
+    def SetTotalButan(self, val): self._mfc["butan"]["total"] = max(0.0, val)
+    def SetTotalCO2(self, val):   self._mfc["co2"]["total"]   = max(0.0, val)
+    def SetTotalN2(self, val):    self._mfc["n2"]["total"]    = max(0.0, val)
+    def SetSetPointPressure(self, kpa): self._setpoint = float(kpa)
+    def SetVP1(self, val):        self._vp1 = max(0, min(255, int(val)))
+    def SetVP2(self, val):        self._vp2 = max(0, min(255, int(val)))
 
-    @attribute(dtype=float)
-    def FlowCO2(self) -> float:
-        return float(self._mfc["co2"]["flow"])
-
-    @attribute(dtype=float)
-    def FlowN2(self) -> float:
-        return float(self._mfc["n2"]["flow"])
-
-    @attribute(dtype=float)
-    def TotalButan(self) -> float:
-        return float(self._mfc["butan"]["total"])
-
-    @attribute(dtype=float)
-    def TotalCO2(self) -> float:
-        return float(self._mfc["co2"]["total"])
-
-    @attribute(dtype=float)
-    def TotalN2(self) -> float:
-        return float(self._mfc["n2"]["total"])
-
-    @attribute(dtype=float)
-    def setPoint_pressure(self) -> float:
-        return float(self._mini2["setpoint_kpa"])
-
-    @attribute(dtype=int)
-    def vp1(self) -> int:
-        return int(self._mini2["pwm1"])
-
-    @attribute(dtype=int)
-    def vp2(self) -> int:
-        return int(self._mini2["pwm2"])
-
-    # ------------- Kommandos (manuelles Setzen) -------------
-    @command(dtype_in=bool)  # V1+V2 gemeinsam
-    def SetStorage(self, open_: bool):
-        self._io["V1"] = bool(open_)
-        self._io["V2"] = bool(open_)
-
-    @command(dtype_in=bool)
-    def SetV3(self, open_: bool):
-        self._io["V3"] = bool(open_)
-
-    @command(dtype_in=bool)
-    def SetFans(self, on: bool):
-        self._io["FanIn"] = bool(on)
-        self._io["FanOut"] = bool(on)
-
-    @command(dtype_in=float)
-    def SetFlowButan(self, flow: float):
-        self._mfc["butan"]["flow"] = max(0.0, float(flow))
-
-    @command(dtype_in=float)
-    def SetFlowCO2(self, flow: float):
-        self._mfc["co2"]["flow"] = max(0.0, float(flow))
-
-    @command(dtype_in=float)
-    def SetFlowN2(self, flow: float):
-        self._mfc["n2"]["flow"] = max(0.0, float(flow))
-
-    @command(dtype_in=float)
-    def SetTotalButan(self, value: float):
-        self._mfc["butan"]["total"] = max(0.0, float(value))
-
-    @command(dtype_in=float)
-    def SetTotalCO2(self, value: float):
-        self._mfc["co2"]["total"] = max(0.0, float(value))
-
-    @command(dtype_in=float)
-    def SetTotalN2(self, value: float):
-        self._mfc["n2"]["total"] = max(0.0, float(value))
-
-    @command(dtype_in=float)
-    def SetSetPointPressure(self, kpa: float):
-        self._mini2["setpoint_kpa"] = float(kpa)
-
-    @command(dtype_in=int)
-    def SetVP1(self, value: int):
-        self._mini2["pwm1"] = max(0, min(255, int(value)))
-
-    @command(dtype_in=int)
-    def SetVP2(self, value: int):
-        self._mini2["pwm2"] = max(0, min(255, int(value)))
-
-    # ------------- Programme -------------
-    @command(dtype_in=str)
-    def RunProgram(self, json_path: str):
-        self.StopProgram()
+    def RunProgram(self, path):
+        if self._prog_thread and self._prog_thread.is_alive():
+            raise tango.DevFailed("Programm läuft bereits")
         self._prog_stop.clear()
-        self._prog_thread = threading.Thread(target=self._program_worker, args=(json_path,), daemon=True)
+        def th():
+            prog = read_program_from_json(path)
+            for step in prog:
+                if self._prog_stop.is_set(): break
+                t = step.get("type")
+                if t == "Normal":
+                    self.SetSetPointPressure(step["target_pressure"])
+                elif t == "Ramp":
+                    self.SetSetPointPressure(step["end_pressure"])
+                elif t == "delay":
+                    time.sleep(step["delay_time"]/1000.0)
+            self.set_status("Programm abgeschlossen")
+        self._prog_thread = threading.Thread(target=th, daemon=True)
         self._prog_thread.start()
 
-    @command()
     def StopProgram(self):
         self._prog_stop.set()
         if self._prog_thread and self._prog_thread.is_alive():
-            self._prog_thread.join(timeout=0.2)
+            self._prog_thread.join(timeout=0.3)
         self._prog_thread = None
 
-    # ------------- Lifecycle -------------
-    def init_device(self):
-        Device.init_device(self)
-        self.set_state(DevState.INIT)
-        self.set_status("Initialisiere Dummy…")
 
-        # Zustände/Caches
-        self._io: Dict[str, Any] = {
-            "V1": False, "V2": False, "V3": False,
-            "FanIn": False, "FanOut": False, "GasLeak": False,
-        }
-        self._mfc: Dict[str, Dict[str, float]] = {
-            "butan": {"flow": 0.0, "total": 0.0},
-            "co2":   {"flow": 0.0, "total": 0.0},
-            "n2":    {"flow": 0.0, "total": 0.0},
-        }
-        self._mini1: Dict[str, Any] = {"pressure_kpa": 101.3}  # Start bei Atmosphärendruck
-        self._mini2: Dict[str, Any] = {"setpoint_kpa": 0.0, "pwm1": 0, "pwm2": 0, "mode": "MANUAL"}
+# ====================== DeviceClass ======================
+class VaderClass(tango.DeviceClass):
+    cmd_list = {
+        "SetStorage":          [[tango.DevBoolean],[tango.DevVoid]],
+        "SetV3":               [[tango.DevBoolean],[tango.DevVoid]],
+        "SetFans":             [[tango.DevBoolean],[tango.DevVoid]],
+        "SetFlowButan":        [[tango.DevDouble], [tango.DevVoid]],
+        "SetFlowCO2":          [[tango.DevDouble], [tango.DevVoid]],
+        "SetFlowN2":           [[tango.DevDouble], [tango.DevVoid]],
+        "SetTotalButan":       [[tango.DevDouble], [tango.DevVoid]],
+        "SetTotalCO2":         [[tango.DevDouble], [tango.DevVoid]],
+        "SetTotalN2":          [[tango.DevDouble], [tango.DevVoid]],
+        "SetSetPointPressure": [[tango.DevDouble], [tango.DevVoid]],
+        "SetVP1":              [[tango.DevLong],   [tango.DevVoid]],
+        "SetVP2":              [[tango.DevLong],   [tango.DevVoid]],
+        "RunProgram":          [[tango.DevString], [tango.DevVoid]],
+        "StopProgram":         [[tango.DevVoid],   [tango.DevVoid]],
+    }
 
-        # Steuerflags/Threads
-        self._stop_evt = threading.Event()
-        self._prog_stop = threading.Event()
-        self._prog_thread = None
-
-        # Poll-/Simulations-Threads
-        self._t_mini1 = threading.Thread(target=self._loop_mini1_20hz, daemon=True)  # 20 Hz
-        self._t_mini2 = threading.Thread(target=self._loop_mini2_05hz, daemon=True)  # 0.5 Hz
-        self._t_maxi  = threading.Thread(target=self._loop_maxi_05hz,  daemon=True)  # 0.5 Hz
-
-        self._last_integrate = time.time()
-        self._t_mini1.start()
-        self._t_mini2.start()
-        self._t_maxi.start()
-
-        self.set_state(DevState.ON)
-        self.set_status("Dummy bereit.")
-
-    def delete_device(self):
-        self.StopProgram()
-        self._stop_evt.set()
-        for t in (self._t_mini1, self._t_mini2, self._t_maxi):
-            if t and t.is_alive():
-                t.join(timeout=0.3)
-        self.set_state(DevState.OFF)
-        self.set_status("Dummy gestoppt.")
-
-    # ------------- Simulation Loops -------------
-    def _loop_mini1_20hz(self):
-        """
-        20 Hz „Physik“:
-          - Druck nähert sich setPoint an (1. Ordnung) mit Dämpfung/Trägheit.
-          - PWM1/PWM2 wirken als „Durchsatz“ & beeinflussen Annäherungsgeschwindigkeit.
-          - Totals = Integral der Flüsse (Butan/CO2/N2).
-          - Leichtes Rauschen; GasLeak gelegentlich abhängig von Flows/Fans.
-        """
-        period = 1.0 / 20.0
-        tau_base = 2.5   # s: Grundträgheit
-        while not self._stop_evt.is_set():
-            t0 = time.time()
-
-            # --- Integrationsschritt ---
-            now = t0
-            dt = max(1e-4, now - self._last_integrate)
-            self._last_integrate = now
-
-            # Druckmodell
-            sp = float(self._mini2["setpoint_kpa"])
-            p  = float(self._mini1["pressure_kpa"])
-            pwm_gain = 1.0 + 0.01 * (self._mini2["pwm1"] + self._mini2["pwm2"])  # 1 .. ~6.1
-            tau = tau_base / pwm_gain
-            dp = (sp - p) * (dt / max(0.3, tau))
-            dp += random.gauss(0.0, 0.01)  # Rauschen
-            p = max(0.0, p + dp)
-            self._mini1["pressure_kpa"] = p
-
-            # Flows integrieren -> Totals
-            for gas in ("butan", "co2", "n2"):
-                flow = float(self._mfc[gas]["flow"])  # Einheit z. B. l/min
-                self._mfc[gas]["total"] += max(0.0, flow) * (dt / 60.0)
-
-            # GasLeak-Heuristik
-            if (self._mfc["butan"]["flow"] + self._mfc["co2"]["flow"] + self._mfc["n2"]["flow"]) > 5.0 and not self._io["FanIn"] and not self._io["FanOut"]:
-                leak_prob = 0.05
-            else:
-                leak_prob = 0.005
-            self._io["GasLeak"] = (random.random() < leak_prob)
-
-            # Loop timing
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, period - elapsed))
-
-    def _loop_mini2_05hz(self):
-        """0.5 Hz: Statuspflege MINI2 (hier nur Mode-Ableitung)."""
-        period = 2.0
-        while not self._stop_evt.is_set():
-            try:
-                if abs(self._mini2["setpoint_kpa"] - self._mini1["pressure_kpa"]) > 2.0:
-                    mode = "AUTOMATIC"
-                elif (self._mini2["pwm1"] + self._mini2["pwm2"]) > 0:
-                    mode = "MANUAL"
-                else:
-                    mode = "IDLE"
-                self._mini2["mode"] = mode
-            except Exception:
-                pass
-            time.sleep(period)
-
-    def _loop_maxi_05hz(self):
-        """0.5 Hz: Sichtbarer Refresh für MAXI (hier keine zusätzliche Physik nötig)."""
-        period = 2.0
-        while not self._stop_evt.is_set():
-            time.sleep(period)
-
-    # ------------- Programm-Worker -------------
-    def _program_worker(self, json_path: str):
-        try:
-            program = read_program_from_json(json_path)
-        except Exception as e:
-            self.set_status(f"Programm-Fehler: {e}")
-            return
-
-        self.set_status(f"Programm gestartet: {json_path} ({len(program)} Schritte)")
-        for step in program:
-            if self._prog_stop.is_set():
-                self.set_status("Programm abgebrochen.")
-                return
-
-            t = step["type"]
-            try:
-                if t == "Normal":
-                    target = float(step["target_pressure"])
-                    self._mini2["setpoint_kpa"] = target
-
-                elif t == "Ramp":
-                    start_p = float(step["start_pressure"])
-                    end_p   = float(step["end_pressure"])
-                    speed   = float(step["ramp_speed"])  # kPa/s
-
-                    # Start setzen
-                    self._mini2["setpoint_kpa"] = start_p
-                    time.sleep(0.2)
-
-                    # Rampe: setpoint linear bewegen
-                    direction = 1.0 if end_p >= start_p else -1.0
-                    sp = start_p
-                    t_last = time.time()
-                    while (direction > 0 and sp < end_p) or (direction < 0 and sp > end_p):
-                        if self._prog_stop.is_set():
-                            break
-                        now = time.time()
-                        dt = now - t_last
-                        t_last = now
-                        sp += direction * speed * dt
-                        if direction > 0:
-                            sp = min(sp, end_p)
-                        else:
-                            sp = max(sp, end_p)
-                        self._mini2["setpoint_kpa"] = sp
-                        time.sleep(0.05)
-
-                elif t == "delay":
-                    ms = int(step["delay_time"])
-                    t_end = time.time() + ms / 1000.0
-                    while time.time() < t_end:
-                        if self._prog_stop.is_set():
-                            break
-                        time.sleep(0.05)
-
-            except Exception as e:
-                self.set_status(f"Programm-Schrittfehler: {e}")
-                continue
-
-        self.set_status("Programm abgeschlossen.")
+    attr_list = {
+        "Storage":          [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "V1":               [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "V2":               [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "V3":               [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "Fans":             [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "GasLeak":          [[tango.DevBoolean, tango.SCALAR, tango.READ]],
+        "FlowButan":        [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "FlowCO2":          [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "FlowN2":           [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "TotalButan":       [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "TotalCO2":         [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "TotalN2":          [[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "setPoint_pressure":[[tango.DevDouble,  tango.SCALAR, tango.READ]],
+        "vp1":              [[tango.DevLong,    tango.SCALAR, tango.READ]],
+        "vp2":              [[tango.DevLong,    tango.SCALAR, tango.READ]],
+    }
 
 
-# ---- main ----
+# ====================== main ======================
+def main():
+    try:
+        util = tango.Util(sys.argv)
+        util.add_class(VaderClass, Vader, "Vader")
+        util.server_init()
+        util.server_run()
+    except tango.DevFailed as e:
+        print("DevFailed:", e)
+    except Exception as e:
+        print("Exception:", e)
+
+
 if __name__ == "__main__":
-    run((VaderDummyDS,))
+    main()
