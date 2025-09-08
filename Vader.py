@@ -213,6 +213,7 @@ class Vader(Device):
             mini2_port=self.mini2_port,
             maxi_port=self.maxi_port
         )
+        time.sleep(5)
 
         # Caches: jetzt mit *eigenen* Setpoint-Feldern
         self.cache_maxi: Dict[str, Any] = {
