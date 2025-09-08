@@ -293,46 +293,188 @@ class MAXI:
         self.dev.close()
 
 
+# parser.add_argument("--port", default="/dev/tty.usbmodem1133201", help="Serieller Port (z.B. /dev/tty.usbmodemXXXXXXXX)")
+# ----------------------- CLI / Test -----------------------
 # ----------------------- CLI / Test -----------------------
 
-def _demo_sequence(mx: MAXI) -> None:
-    print("Frage Status ab ...")
+import math
+from contextlib import suppress
+
+# ---- neue/ersetzte Helpers ----
+def _nearly(a: float, b: float, tol: float = 0.02) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except Exception:
+        return False
+
+def _require(cond: bool, msg: str):
+    if not cond:
+        raise AssertionError(msg)
+
+def _keys_ok(s: Dict[str, Any]) -> None:
+    _require(isinstance(s, dict), "Status ist kein Dict")
+    for k in ("io", "adc", "mfc"):
+        _require(k in s, f"Key '{k}' fehlt im Status")
+    for k in ("P11", "P31"):
+        _require(k in s["adc"], f"ADC '{k}' fehlt")
+    for g in ("co2", "n2", "butan"):
+        _require(g in s["mfc"], f"MFC '{g}' fehlt")
+        for f in ("flow", "total"):
+            _require(f in s["mfc"][g], f"MFC '{g}.{f}' fehlt")
+
+def _check_toggle(mx: "MAXI", func_name: str, io_key: str):
+    func = getattr(mx, func_name)
+    s1 = func(True)
+    _keys_ok(s1); _require(s1["io"][io_key] is True, f"{io_key} sollte True sein nach {func_name}(True)")
+    s2 = func(False)
+    _keys_ok(s2); _require(s2["io"][io_key] is False, f"{io_key} sollte False sein nach {func_name}(False)")
+
+def _read_sp(s: Dict[str, Any], mfc_key: str):
+    sp = s["mfc"][mfc_key].get("setpoint")
+    return None if sp is None else float(sp)
+
+def _check_set_flow(mx: "MAXI", func_name: str, mfc_key: str, value: float,
+                    maxflow: float, strict: bool):
+    """
+    Erwartung:
+      - Wenn 0 <= value <= maxflow: Setpoint ~== value (±0.02)
+      - Wenn value > maxflow: Gerät darf clippen/ignorieren -> WARN (oder FAIL in strict)
+    """
+    func = getattr(mx, func_name)
+
+    # Vorherigen SP merken
+    s_prev = mx.get_status()
+    _keys_ok(s_prev)
+    sp_prev = _read_sp(s_prev, mfc_key)
+
+    # Setzen
+    s = func(value)
+    _keys_ok(s)
+    sp_now = _read_sp(s, mfc_key)
+
+    _require(sp_now is not None, f"Setpoint {mfc_key} wurde nicht mitgesendet")
+
+    if 0.0 <= value <= maxflow:
+        _require(_nearly(sp_now, value),
+                 f"{mfc_key} Setpoint ~={value} erwartet, got {sp_now}")
+    else:
+        # Out-of-range: akzeptiere 'no change' oder 'clip ≤ maxflow'
+        if strict:
+            _require(_nearly(sp_now, value) or
+                     (sp_prev is not None and _nearly(sp_now, sp_prev)) or
+                     (sp_now <= maxflow + 1e-9),
+                     f"{mfc_key} Out-of-range Verhalten unerwartet: wanted>{maxflow}, got {sp_now}, prev {sp_prev}")
+        else:
+            logging.getLogger(f"{MODULE_LOGGER_NAME}.Selftest").warning(
+                "%s Setpoint %.3f außerhalb Range (max %.3f). Gerät antwortete mit %.3f (prev %.3f).",
+                mfc_key.upper(), value, maxflow, sp_now, sp_prev if sp_prev is not None else float("nan")
+            )
+
+def _check_set_total(mx: "MAXI", func_name: str, mfc_key: str, value: float):
+    func = getattr(mx, func_name)
+    s = func(value)
+    _keys_ok(s)
+    tot = s["mfc"][mfc_key]["total"]
+    _require(_nearly(tot, value), f"{mfc_key} Total ~={value} erwartet, got {tot}")
+
+def run_selftest(mx: "MAXI", *, maxflow: float, strict: bool):
+    print("▶︎ Selbsttest startet …")
+
+    # 0) Smoke
+    print("  • Frage Status ab …")
+    s0 = mx.get_status()
+    _keys_ok(s0)
+
+    # 1) IO
+    print("  • Toggle V1/V2/V3 …")
+    _check_toggle(mx, "set_v1", "V1")
+    _check_toggle(mx, "set_v2", "V2")
+    _check_toggle(mx, "set_v3", "V3")
+
+    print("  • Toggle FanIn/FanOut …")
+    _check_toggle(mx, "set_fan_in", "FanIn")
+    _check_toggle(mx, "set_fan_out", "FanOut")
+
+    # 2) MFC Setpoints – „sichere“ Werte im Bereich
+    print("  • Setze MFC-Setpoints (CO2/N2/Butan) …")
+    _check_set_flow(mx, "set_flow_co2",  "co2",   5.00, maxflow, strict)
+    _check_set_flow(mx, "set_flow_n2",   "n2",    3.25, maxflow, strict)
+    _check_set_flow(mx, "set_flow_butan","butan", 1.00, maxflow, strict)
+
+    # 3) Totals
+    print("  • Schreibe/prüfe Totalisatoren …")
+    _check_set_total(mx, "set_total_co2",  "co2",   0.00)
+    _check_set_total(mx, "set_total_n2",   "n2",    0.00)
+    _check_set_total(mx, "set_total_butan","butan", 0.00)
+
+    # 4) Expliziter Request-Status
+    print("  • Expliziter Request-Status und direktes RX …")
+    mx.request_status()
+    s_req = mx._rx_status_once()
+    _keys_ok(s_req)
+
+    # 5) Sammelfenster
+    print("  • Test Sammelfenster (settle_ms) …")
+    old_settle = mx.settle_ms
+    try:
+        mx.settle_ms = 150
+        s_settle = mx.get_status()
+        _keys_ok(s_settle)
+    finally:
+        mx.settle_ms = old_settle
+
+    # 6) Roundtrip & Out-of-range Probe (keine harte Assertion, außer --strict-setpoint)
+    print("  • Roundtrip & Out-of-range Probe …")
+    _check_set_flow(mx, "set_flow_co2", "co2", 0.00, maxflow, strict)
+    _check_set_flow(mx, "set_flow_co2", "co2", 0.01, maxflow, strict)
+    _check_set_flow(mx, "set_flow_co2", "co2", maxflow * 1.5, maxflow, strict)  # ggf. clip/ignore
+
+    print("✅ Selbsttest abgeschlossen – alle Checks OK (unter den gewählten Grenzen).")
+
+def _demo_sequence(mx: "MAXI") -> None:
+    print("Frage Status ab …")
     print(mx.get_status())
 
-    print("\nV1 = OPEN ...")
+    print("\nV1 = OPEN …")
     print(mx.set_v1(True))
 
-    print("\nV1 = CLOSE ...")
+    print("\nV1 = CLOSE …")
     print(mx.set_v1(False))
 
-    print("\nCO2 Flow = 5.0 sccm ...")
+    print("\nCO2 Flow = 5.0 sccm …")
     print(mx.set_flow_co2(5.0))
 
-    print("\nNochmals Status ...")
+    print("\nNochmals Status …")
     print(mx.get_status())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MAXI Treiber – synchrones Testtool")
-    parser.add_argument("--port", default="/dev/tty.usbmodem1133201", help="Serieller Port (z.B. /dev/tty.usbmodemXXXXXXXX)")
-    parser.add_argument("--timeout", type=float, default=8.0, help="RX Timeout in Sekunden")
-    parser.add_argument("--settle", type=int, default=0, help="Sammelfenster in ms (0 zum Deaktivieren)")
-    parser.add_argument("--log", default="DEBUG", help="Loglevel (DEBUG/INFO/WARN/ERROR)")
+    parser.add_argument("--port", default="/dev/cu.usbmodem1133201")
+    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument("--settle", type=int, default=0)
+    parser.add_argument("--log", default="DEBUG")
+    parser.add_argument("--selftest", action="store_true", default=True)
+    parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--maxflow", type=float, default=10.0, help="erwartete Maximalrange für Flow-Setpoints (sccm)")
+    parser.add_argument("--strict-setpoint", action="store_true", help="Out-of-range Verhalten als Fehler werten")
     args = parser.parse_args()
 
     level = getattr(logging, args.log.upper(), logging.DEBUG)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    mx = None
     try:
         mx = MAXI(args.port, timeout=args.timeout, settle_ms=args.settle)
-        _demo_sequence(mx)
+        if args.demo and not args.selftest:
+            _demo_sequence(mx)
+        else:
+            run_selftest(mx, maxflow=args.maxflow, strict=args.strict_setpoint)
     except Exception as e:
         print(f"Fehler: {e}")
+        raise
     finally:
         try:
-            mx.close()
+            if mx: mx.close()
         except Exception:
             pass
