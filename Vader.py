@@ -43,6 +43,41 @@ class Vader(Device):
     mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
     maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
 
+    # ============ Hilfsroutinen für MAXI-Kommunikation ============
+    def _update_maxi_cache_from_status(self, status: Dict[str, Any]) -> None:
+        """Nur Ist-Werte und IO-Flags in den Cache übernehmen, Setpoints nicht überschreiben."""
+        if not isinstance(status, dict):
+            return
+        # IO (inkl. V3 falls vorhanden)
+        io = status.get("io") or {}
+        for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
+            if k in io:
+                self.cache_maxi["io"][k] = bool(io[k])
+
+        # Nur Ist-Werte übernehmen (Setpoints nicht überschreiben!)
+        mfc = status.get("mfc") or {}
+        for gas in ("butan", "co2", "n2"):
+            mg = mfc.get(gas) or {}
+            self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
+            self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
+
+        adc = status.get("adc") or {}
+        self.cache_maxi["adc"]["P11"] = adc.get("P11")
+        self.cache_maxi["adc"]["P31"] = adc.get("P31")
+        self.cache_maxi["ts"] = time.time()
+
+    def _async(self, fn, *args, **kwargs) -> None:
+        """Feuer-und-vergiss: führt MAXI-Kommandos im Hintergrund aus und aktualisiert danach den Cache."""
+        def worker():
+            try:
+                fn(*args, **kwargs)  # z.B. driver.set_flow_co2(v)
+                status = self.driver.maxi_get_status()  # frischen Status holen (Roundtrip)
+                self._update_maxi_cache_from_status(status)
+            except Exception:
+                # Absichtlich still – Tango-Schreibaufruf soll nicht blockieren/fehlschlagen
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
     # ============ Attribute ============
     # large_high_pressure_volume = (V1 && V2)
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
@@ -85,15 +120,15 @@ class Vader(Device):
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
     # --------- Setpoint-Flows (READ/WRITE, nur positiv) ---------
-    # WICHTIG: liest/schreibt jetzt *separate* Setpoint-Felder (kein Ist-Flow mehr).
+    # WICHTIG: liest/schreibt *separate* Setpoint-Felder (kein Ist-Flow mehr) und schreibt asynchron zum Gerät.
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_Butan_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_Butan_nl_per_min(self, value: float):
         v = max(0.0, float(value))
-        self.driver.set_flow_butan(v)
-        self.cache_maxi["mfc"]["butan"]["setpoint"] = v
+        self.cache_maxi["mfc"]["butan"]["setpoint"] = v  # sofort sichtbar
+        self._async(self.driver.set_flow_butan, v)           # non-blocking Geräteaufruf
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_CO2_nl_per_min(self) -> float:
@@ -101,8 +136,8 @@ class Vader(Device):
 
     def write_setpoint_flow_CO2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
-        self.driver.set_flow_co2(v)
         self.cache_maxi["mfc"]["co2"]["setpoint"] = v
+        self._async(self.driver.set_flow_co2, v)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_N2_nl_per_min(self) -> float:
@@ -110,8 +145,8 @@ class Vader(Device):
 
     def write_setpoint_flow_N2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
-        self.driver.set_flow_n2(v)
         self.cache_maxi["mfc"]["n2"]["setpoint"] = v
+        self._async(self.driver.set_flow_n2, v)
 
     # --------- Ist-Flows (READ ONLY) ---------
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
@@ -213,7 +248,6 @@ class Vader(Device):
             mini2_port=self.mini2_port,
             maxi_port=self.maxi_port
         )
-        time.sleep(5)
 
         # Caches: jetzt mit *eigenen* Setpoint-Feldern
         self.cache_maxi: Dict[str, Any] = {
@@ -302,29 +336,11 @@ class Vader(Device):
             time.sleep(period)
 
     def _poll_maxi(self):
-        period = 2.0
+        period = 2.0  # ggf. 0.5–1.0 s für schnellere Aktualisierung
         while not self._stop_evt.is_set():
             try:
-                # Vorher: self.driver.maxi_request_status()  # ENTFERNT
-                status = self.driver.maxi_get_status()       # vollständiger Roundtrip
-
-                io = status.get("io") or {}
-                # V3 zusätzlich mit übernehmen, falls Firmware es liefert
-                for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
-                    if k in io:
-                        self.cache_maxi["io"][k] = bool(io[k])
-
-                # Nur Ist-Werte übernehmen (Setpoints nicht überschreiben!)
-                mfc = status.get("mfc") or {}
-                for gas in ("butan", "co2", "n2"):
-                    mg = mfc.get(gas) or {}
-                    self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
-                    self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
-
-                adc = status.get("adc") or {}
-                self.cache_maxi["adc"]["P11"] = adc.get("P11")
-                self.cache_maxi["adc"]["P31"] = adc.get("P31")
-                self.cache_maxi["ts"] = time.time()
+                status = self.driver.maxi_get_status()  # vollständiger Roundtrip (keine separate Request!)
+                self._update_maxi_cache_from_status(status)
             except Exception:
                 pass
             time.sleep(period)
