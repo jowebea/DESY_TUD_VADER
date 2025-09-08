@@ -12,34 +12,53 @@ from tango.server import Device, attribute, command, run, device_property
 
 # === Treiber ===
 from VaderDeviceDriver import VaderDeviceDriver
-import logging, time
-from utilities import MODULE_LOGGER_NAME  # falls vorhanden
 
-class _StatusLogHandler(logging.Handler):
-    """
-    Leitet Logeinträge an Tango set_status() weiter.
-    Throttling verhindert Status-Flackern bei hoher Lograte.
-    """
-    def __init__(self, device, level=logging.INFO, min_interval=0.5):
-        super().__init__(level)
-        self.device = device
-        self.min_interval = float(min_interval)
-        self._last_ts = 0.0
-        self._last_msg = ""
+# ===== Helpers for robust MAXI parsing =====
+def _coerce_float(v, default=0.0):
+    try:
+        if v is None:
+            return float(default)
+        if isinstance(v, (int, float)):
+            return float(v)
+        # strings like "0.7", "0,7"
+        s = str(v).strip().replace(",", ".")
+        return float(s)
+    except Exception:
+        return float(default)
 
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            now = time.time()
-            # sanftes Rate-Limit: max. alle min_interval s
-            if (now - self._last_ts) < self.min_interval and msg == self._last_msg:
-                return
-            self.device.set_status(msg)
-            self._last_ts = now
-            self._last_msg = msg
-        except Exception:
-            # Niemals Logging das Gerät stören lassen
-            pass
+_GAS_ALIASES = {
+    "butan": ("butan", "but", "butane", "c4", "c4h10"),
+    "co2":   ("co2", "CO2", "carbon_dioxide"),
+    "n2":    ("n2", "N2", "nitrogen"),
+}
+
+_MFC_KEYS = {
+    "flow": ("flow", "q", "q_nl_min", "flow_nl_min", "flow_sccm"),
+    "total": ("total", "sum", "integral", "accum"),
+    "setpoint": ("setpoint", "sp", "target", "set"),
+}
+
+def _extract_mfc_gas_block(mfc_dict: dict, gas: str) -> dict:
+    """Return the most plausible sub-dict for a gas, considering aliases."""
+    if not isinstance(mfc_dict, dict):
+        return {}
+    # Exact
+    if gas in mfc_dict and isinstance(mfc_dict[gas], dict):
+        return mfc_dict[gas]
+    # Aliases
+    for alias in _GAS_ALIASES.get(gas, (gas,)):
+        block = mfc_dict.get(alias)
+        if isinstance(block, dict):
+            return block
+    # Fallback empty
+    return {}
+
+def _get_first_key(d: dict, keys: tuple):
+    for k in keys:
+        if k in d:
+            return k
+    return None
+
 
 # ---------------- JSON-Programm lesen ----------------
 def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
@@ -72,7 +91,9 @@ class Vader(Device):
 
     # ============ Hilfsroutinen für MAXI-Kommunikation ============
     def _update_maxi_cache_from_status(self, status: Dict[str, Any]) -> None:
-        """Nur Ist-Werte und IO-Flags in den Cache übernehmen, Setpoints nicht überschreiben."""
+        """Nur Ist-Werte und IO-Flags in den Cache übernehmen, Setpoints nicht überschreiben.
+        Robuste Extraktion mit Gas-/Feld-Aliases.
+        """
         if not isinstance(status, dict):
             return
         # IO (inkl. V3 falls vorhanden)
@@ -81,12 +102,22 @@ class Vader(Device):
             if k in io:
                 self.cache_maxi["io"][k] = bool(io[k])
 
-        # Nur Ist-Werte übernehmen (Setpoints nicht überschreiben!)
+        # MFC-Werte extrahieren
         mfc = status.get("mfc") or {}
         for gas in ("butan", "co2", "n2"):
-            mg = mfc.get(gas) or {}
-            self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
-            self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
+            block = _extract_mfc_gas_block(mfc, gas)
+            if not block:
+                continue
+            # Flow
+            flow_key = _get_first_key(block, _MFC_KEYS["flow"])
+            if flow_key:
+                self.cache_maxi["mfc"][gas]["flow"] = _coerce_float(block.get(flow_key), 0.0)
+            # Total
+            total_key = _get_first_key(block, _MFC_KEYS["total"])
+            if total_key:
+                self.cache_maxi["mfc"][gas]["total"] = _coerce_float(block.get(total_key), 0.0)
+            # Optional: wenn Firmware Setpoint mitsendet, nur internen Diagnose-Cache updaten, NICHT Attribute-Setpoints
+            # (Attribut-Setpoints bleiben vom Client gesteuert)
 
         adc = status.get("adc") or {}
         self.cache_maxi["adc"]["P11"] = adc.get("P11")
@@ -155,8 +186,7 @@ class Vader(Device):
     def write_setpoint_flow_Butan_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["butan"]["setpoint"] = v  # sofort sichtbar
-        self.driver.set_flows(butan=v, verify=True, timeout_s=1.0, tol=0.05)
-
+        self._async(self.driver.set_flow_butan, v)           # non-blocking Geräteaufruf
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_CO2_nl_per_min(self) -> float:
@@ -165,7 +195,7 @@ class Vader(Device):
     def write_setpoint_flow_CO2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["co2"]["setpoint"] = v
-        self.driver.set_flows(co2=v, verify=True, timeout_s=1.0, tol=0.05)
+        self._async(self.driver.set_flow_co2, v)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_N2_nl_per_min(self) -> float:
@@ -174,7 +204,7 @@ class Vader(Device):
     def write_setpoint_flow_N2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["n2"]["setpoint"] = v
-        self.driver.set_flows(n2=v, verify=True, timeout_s=1.0, tol=0.05)
+        self._async(self.driver.set_flow_n2, v)
 
     # --------- Ist-Flows (READ ONLY) ---------
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
@@ -271,32 +301,6 @@ class Vader(Device):
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
 
-        # --- Logging global auf INFO setzen (optional: einmalig) ---
-        logging.basicConfig(level=logging.INFO,
-                            format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-                            datefmt="%H:%M:%S")
-
-        # --- Status-Handler anlegen + Formatter ---
-        self._status_handler = _StatusLogHandler(self, level=logging.INFO, min_interval=0.5)
-        self._status_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"
-        ))
-
-        # --- Eigene Logger: Tango-Server + Treiber/Module auf INFO + Handler anhängen ---
-        self.logger = logging.getLogger("Vader.Tango")
-        self.logger.setLevel(logging.INFO)
-        self.logger.addHandler(self._status_handler)
-
-        # Treiber-Logger (Name aus deinem Projekt; MODULE_LOGGER_NAME wird im Treiber genutzt)
-        for name in (MODULE_LOGGER_NAME,
-                    f"{MODULE_LOGGER_NAME}.VaderDeviceDriver",
-                    f"{MODULE_LOGGER_NAME}.MAXI",
-                    f"{MODULE_LOGGER_NAME}.MINI1",
-                    f"{MODULE_LOGGER_NAME}.MINI2"):
-            lg = logging.getLogger(name)
-            lg.setLevel(logging.INFO)
-            lg.addHandler(self._status_handler)
-
         self.driver = VaderDeviceDriver(
             mini1_port=self.mini1_port,
             mini2_port=self.mini2_port,
@@ -328,7 +332,9 @@ class Vader(Device):
             self.driver.set_fans(False)
 
             # Alle Gas-Setpoints auf 0
-            self.driver.set_flows(n2=0, co2=0, butan=0, verify=True, timeout_s=1.0, tol=0.05)
+            self.driver.set_flow_butan(0.0)
+            self.driver.set_flow_co2(0.0)
+            self.driver.set_flow_n2(0.0)
 
             # Druck-Setpoint auf 0
             self.driver.setpoint_pressure(0.0)
@@ -360,21 +366,6 @@ class Vader(Device):
             pass
         self.set_state(DevState.OFF)
         self.set_status("Gestoppt.")
-        try:
-            # Handler von allen Loggern wieder abklemmen (sonst doppelte Ausgaben nach Reload)
-            for name in ("Vader.Tango", MODULE_LOGGER_NAME,
-                        f"{MODULE_LOGGER_NAME}.VaderDeviceDriver",
-                        f"{MODULE_LOGGER_NAME}.MAXI",
-                        f"{MODULE_LOGGER_NAME}.MINI1",
-                        f"{MODULE_LOGGER_NAME}.MINI2"):
-                lg = logging.getLogger(name)
-                if hasattr(self, "_status_handler"):
-                    try:
-                        lg.removeHandler(self._status_handler)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
     # ============ Poller ============
     def _poll_mini1(self):
@@ -403,14 +394,25 @@ class Vader(Device):
             time.sleep(period)
 
     def _poll_maxi(self):
-        period = 2.0  # ggf. 0.5–1.0 s für schnellere Aktualisierung
+        period = 0.5  # schnellere Aktualisierung; watchdog-Style Timing
+        next_due = 0.0
         while not self._stop_evt.is_set():
+            now = time.time()
+            if now < next_due:
+                time.sleep(min(0.05, next_due - now))
+                continue
             try:
-                status = self.driver.maxi_get_status()  # vollständiger Roundtrip (keine separate Request!)
+                # Einige Firmwares senden zwischendurch Heartbeats ohne MFC-Block.
+                # Wir lesen im Zweifel zweimal und nehmen den ersten mit MFC-Daten.
+                status = self.driver.maxi_get_status()
+                if not isinstance(status, dict) or not status.get("mfc"):
+                    status2 = self.driver.maxi_get_status()
+                    if isinstance(status2, dict):
+                        status = status2
                 self._update_maxi_cache_from_status(status)
             except Exception:
                 pass
-            time.sleep(period)
+            next_due = time.time() + period
 
     # ============ Programm-Worker ============
     def _program_worker(self, json_path: str):
