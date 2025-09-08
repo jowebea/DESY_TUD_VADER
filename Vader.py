@@ -12,7 +12,34 @@ from tango.server import Device, attribute, command, run, device_property
 
 # === Treiber ===
 from VaderDeviceDriver import VaderDeviceDriver
+import logging, time
+from utilities import MODULE_LOGGER_NAME  # falls vorhanden
 
+class _StatusLogHandler(logging.Handler):
+    """
+    Leitet Logeinträge an Tango set_status() weiter.
+    Throttling verhindert Status-Flackern bei hoher Lograte.
+    """
+    def __init__(self, device, level=logging.INFO, min_interval=0.5):
+        super().__init__(level)
+        self.device = device
+        self.min_interval = float(min_interval)
+        self._last_ts = 0.0
+        self._last_msg = ""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            now = time.time()
+            # sanftes Rate-Limit: max. alle min_interval s
+            if (now - self._last_ts) < self.min_interval and msg == self._last_msg:
+                return
+            self.device.set_status(msg)
+            self._last_ts = now
+            self._last_msg = msg
+        except Exception:
+            # Niemals Logging das Gerät stören lassen
+            pass
 
 # ---------------- JSON-Programm lesen ----------------
 def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
@@ -244,6 +271,32 @@ class Vader(Device):
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
 
+        # --- Logging global auf INFO setzen (optional: einmalig) ---
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+                            datefmt="%H:%M:%S")
+
+        # --- Status-Handler anlegen + Formatter ---
+        self._status_handler = _StatusLogHandler(self, level=logging.INFO, min_interval=0.5)
+        self._status_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"
+        ))
+
+        # --- Eigene Logger: Tango-Server + Treiber/Module auf INFO + Handler anhängen ---
+        self.logger = logging.getLogger("Vader.Tango")
+        self.logger.setLevel(logging.INFO)
+        self.logger.addHandler(self._status_handler)
+
+        # Treiber-Logger (Name aus deinem Projekt; MODULE_LOGGER_NAME wird im Treiber genutzt)
+        for name in (MODULE_LOGGER_NAME,
+                    f"{MODULE_LOGGER_NAME}.VaderDeviceDriver",
+                    f"{MODULE_LOGGER_NAME}.MAXI",
+                    f"{MODULE_LOGGER_NAME}.MINI1",
+                    f"{MODULE_LOGGER_NAME}.MINI2"):
+            lg = logging.getLogger(name)
+            lg.setLevel(logging.INFO)
+            lg.addHandler(self._status_handler)
+
         self.driver = VaderDeviceDriver(
             mini1_port=self.mini1_port,
             mini2_port=self.mini2_port,
@@ -307,6 +360,21 @@ class Vader(Device):
             pass
         self.set_state(DevState.OFF)
         self.set_status("Gestoppt.")
+        try:
+            # Handler von allen Loggern wieder abklemmen (sonst doppelte Ausgaben nach Reload)
+            for name in ("Vader.Tango", MODULE_LOGGER_NAME,
+                        f"{MODULE_LOGGER_NAME}.VaderDeviceDriver",
+                        f"{MODULE_LOGGER_NAME}.MAXI",
+                        f"{MODULE_LOGGER_NAME}.MINI1",
+                        f"{MODULE_LOGGER_NAME}.MINI2"):
+                lg = logging.getLogger(name)
+                if hasattr(self, "_status_handler"):
+                    try:
+                        lg.removeHandler(self._status_handler)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # ============ Poller ============
     def _poll_mini1(self):
