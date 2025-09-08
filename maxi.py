@@ -399,7 +399,7 @@ def run_selftest(mx: "MAXI", *, maxflow: float, strict: bool):
     print("  • Setze MFC-Setpoints (CO2/N2/Butan) …")
     _check_set_flow(mx, "set_flow_co2",  "co2",   5.00, maxflow, strict)
     _check_set_flow(mx, "set_flow_n2",   "n2",    3.25, maxflow, strict)
-    _check_set_flow(mx, "set_flow_butan","butan", 1.00, maxflow, strict)
+    _check_set_flow(mx, "set_flow_butan","butan", 0.00, maxflow, strict)
 
     # 3) Totals
     print("  • Schreibe/prüfe Totalisatoren …")
