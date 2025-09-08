@@ -304,15 +304,16 @@ class Vader(Device):
         period = 2.0
         while not self._stop_evt.is_set():
             try:
-                self.driver.maxi_request_status()
-                status = self.driver.maxi_get_status()
+                # Vorher: self.driver.maxi_request_status()  # ENTFERNT
+                status = self.driver.maxi_get_status()       # vollständiger Roundtrip
 
                 io = status.get("io") or {}
-                for k in ("V1", "V2", "FanIn", "FanOut", "GasLeak"):
+                # V3 zusätzlich mit übernehmen, falls Firmware es liefert
+                for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
                     if k in io:
                         self.cache_maxi["io"][k] = bool(io[k])
 
-                # Nur *Ist*-Werte übernehmen, Setpoints nicht überschreiben!
+                # Nur Ist-Werte übernehmen (Setpoints nicht überschreiben!)
                 mfc = status.get("mfc") or {}
                 for gas in ("butan", "co2", "n2"):
                     mg = mfc.get(gas) or {}
