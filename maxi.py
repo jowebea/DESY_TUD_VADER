@@ -1,34 +1,41 @@
 # -*- coding: utf-8 -*-
 """
 maxi.py
-- MAXI Treiber (neues Protokoll mit Sync + Payload + CS)
-- MAXI Emulator (_MaxiEmu)
+Finaler synchroner MAXI-Treiber:
+- SET senden, genau EIN Status-Frame empfangen
+- Robust gegenüber Heartbeats (optional: settle_ms-Sammelfenster)
+- Sauberes DEBUG-Logging aller RX-Chunks und Frames
 """
 
 import logging
-import threading
 import time
-import math
 import struct
+import argparse
 from typing import Dict, Any, Union
 
-from utilities import (
-    MODULE_LOGGER_NAME, _hexdump, SerialDevice,
-    _MockFirmwareMailbox, _BaseEmu, _MockEndpoint
-)
+# Erwartet Hilfsfunktionen/Klassen aus deinem Projekt:
+# utilities._hexdump: bytes -> "AA BB ..."
+# utilities.SerialDevice: Abstraktion für realen/mocked Serial-Port
+from utilities import MODULE_LOGGER_NAME, _hexdump, SerialDevice
 
-# ====================== MAXI Emulator ======================
 
-class _MaxiEmu(_BaseEmu):
+class MAXI:
     """
-    Emuliert MAXI-Protokoll.
-    Status:
-      0xAA 0x55, LEN=25, PAYLOAD[LEN], CS=sum(PAYLOAD)&0xFF
-    SET:
-      0xA5 0x5A 0x01 0x04  PAYLOAD(le32)  CS
-      PAYLOAD le32: WORD = (DATA26<<6) | ADDR6
+    Synchroner MAXI-Treiber (ein Gerät pro Port).
+    Workflow: _tx_set_once() -> _rx_status_once() -> parsed Dict
+
+    Parameter:
+      port:       z.B. '/dev/tty.usbmodem1133201'
+      timeout:    Gesamttimeout für das Warten auf Status (Sekunden)
+      settle_ms:  optionales Mini-Fenster (ms): liefere das *letzte* gültige Frame,
+                  das innerhalb des Fensters nach dem ersten Treffer eintrifft.
+                  Nützlich, wenn auf der Leitung zusätzlich ein Heartbeat läuft.
     """
+    # Status-Frame
     SYNC0, SYNC1 = 0xAA, 0x55
+    STATUS_LEN = 29
+
+    # SET-Frame
     H0, H1, CMD_SET, SET_LEN = 0xA5, 0x5A, 0x01, 0x04
 
     # ADDR6
@@ -39,240 +46,29 @@ class _MaxiEmu(_BaseEmu):
     A_FlowN2,  A_TotN2  = 0x12, 0x13
     A_FlowBut, A_TotBut = 0x14, 0x15
 
-    STATUS_LEN = 25
-
-    def __init__(self, ep: _MockEndpoint):
-        super().__init__(ep, "MAXI-EMU")
-        self._rx = bytearray()
-        self.io = {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False}
-        self.adc_P11 = 1234
-        self.adc_P31 = 2345
-        self.flow = {"co2": 0.0, "n2": 0.0, "but": 0.0}
-        self.total = {"co2": 0.0, "n2": 0.0, "but": 0.0}
-        self._last = time.time()
-
-    # Helpers
-    @staticmethod
-    def _sumcs(b: bytes) -> int:
-        return sum(b) & 0xFF
-
-    @staticmethod
-    def _le16(v: int) -> bytes:
-        return struct.pack("<H", v & 0xFFFF)
-
-    @staticmethod
-    def _le32(v: int) -> bytes:
-        return struct.pack("<I", v & 0xFFFFFFFF)
-
-    def _apply_set(self, addr6: int, data26: int) -> None:
-        self.logger.debug("SET addr=0x%02X data=%d", addr6, data26)
-        if addr6 == self.A_RequestStatus:
-            self._send_status()
-            return
-        if addr6 == self.A_V1:     self.io["V1"] = (data26 != 0)
-        elif addr6 == self.A_V2:   self.io["V2"] = (data26 != 0)
-        elif addr6 == self.A_V3:   self.io["V3"] = (data26 != 0)
-        elif addr6 == self.A_FanIn:  self.io["FanIn"] = (data26 != 0)
-        elif addr6 == self.A_FanOut: self.io["FanOut"] = (data26 != 0)
-        elif addr6 == self.A_FlowCO2: self.flow["co2"] = min(9999.0, data26/100.0)
-        elif addr6 == self.A_FlowN2:  self.flow["n2"]  = min(9999.0, data26/100.0)
-        elif addr6 == self.A_FlowBut: self.flow["but"] = min(9999.0, data26/100.0)
-        elif addr6 == self.A_TotCO2:  self.total["co2"] = data26/100.0
-        elif addr6 == self.A_TotN2:   self.total["n2"]  = data26/100.0
-        elif addr6 == self.A_TotBut:  self.total["but"] = data26/100.0
-
-    def _host_write_bytes(self, data: bytes) -> None:
-        self._rx.extend(data)
-        self.logger.debug("RX += %d B (hex: %s)", len(data), _hexdump(data))
-        while True:
-            if len(self._rx) < 6:
-                return
-            h0, h1, cmd, ln = self._rx[0], self._rx[1], self._rx[2], self._rx[3]
-            if h0 != self.H0 or h1 != self.H1 or cmd != self.CMD_SET or ln != self.SET_LEN:
-                self.logger.warning("Desync byte (0x%02X) - resync", self._rx[0])
-                self._rx.pop(0)
-                continue
-            total = 4 + ln + 1
-            if len(self._rx) < total:
-                return
-            payload = bytes(self._rx[4:4+ln])
-            cs = self._rx[4+ln]
-            del self._rx[:total]
-            if self._sumcs(payload) != cs:
-                self.logger.warning("Checksum mismatch: exp=%02X got=%02X payload=%s", self._sumcs(payload), cs, _hexdump(payload))
-                continue
-            import struct as _st
-            word, = _st.unpack("<I", payload)
-            addr6 = word & 0x3F
-            data26 = (word >> 6) & 0x03FF_FFFF
-            self._apply_set(addr6, data26)
-
-    def _dynamics(self, dt: float) -> None:
-        self.total["co2"] += self.flow["co2"] * dt / 60.0
-        self.total["n2"]  += self.flow["n2"]  * dt / 60.0
-        self.total["but"] += self.flow["but"] * dt / 60.0
-        self.adc_P11 = int(1500 + 300*math.sin(time.time()/7))
-        self.adc_P31 = int(2200 + 400*math.sin(time.time()/9 + 1.0))
-        self.io["GasLeak"] = (int(time.time()) % 127 == 0)
-
-    def _pack_status_payload(self) -> bytes:
-        flags = (
-            (1 if self.io["GasLeak"] else 0) |
-            (1 if self.io["V1"] else 0) << 1 |
-            (1 if self.io["V2"] else 0) << 2 |
-            (1 if self.io["V3"] else 0) << 3 |
-            (1 if self.io["FanIn"] else 0) << 4 |
-            (1 if self.io["FanOut"] else 0) << 5
-        )
-
-        p = bytearray()
-        p.append(flags & 0xFF)
-        p += self._le16(self.adc_P11)
-        p += self._le16(self.adc_P31)
-        p += self._le16(int(round(self.flow["co2"]*100)))
-        p += self._le32(int(round(self.total["co2"]*100)))
-        p += self._le16(int(round(self.flow["n2"]*100)))
-        p += self._le32(int(round(self.total["n2"]*100)))
-        p += self._le16(int(round(self.flow["but"]*100)))
-        p += self._le32(int(round(self.total["but"]*100)))
-        while len(p) < self.STATUS_LEN:
-            p.append(0)
-        return bytes(p[:self.STATUS_LEN])
-
-    def _send_status(self) -> None:
-        payload = self._pack_status_payload()
-        frame = bytes([self.SYNC0, self.SYNC1, len(payload)]) + payload + bytes([self._sumcs(payload)])
-        self.ep.feed(frame)
-        self.logger.debug("Status sent (%d B payload, cs=%02X): %s", len(payload), self._sumcs(payload), _hexdump(frame))
-
-    def _loop(self) -> None:
-        acc = 0.0
-        while self._running:
-            data = _MockFirmwareMailbox.get(self.ep)
-            if data:
-                self._host_write_bytes(data)
-            now = time.time()
-            if not hasattr(self, "_t_prev"):
-                self._t_prev = now
-            dt = now - self._t_prev
-            self._t_prev = now
-            self._dynamics(dt)
-            acc += dt
-            if acc >= 0.04:
-                acc = 0.0
-                self._send_status()
-            time.sleep(0.005)
-        self.logger.debug("Loop exited")
-
-# ====================== MAXI Treiber ======================
-
-class MAXI:
-    """
-    MAXI-Treiber (API unverändert), spricht mit MAXI-Emu oben.
-    """
-    SYNC0 = 0xAA
-    SYNC1 = 0x55
-    STATUS_LEN = 25
-
-    H0 = 0xA5
-    H1 = 0x5A
-    CMD_SET = 0x01
-    SET_LEN = 0x04
-
-    A_RequestStatus = 0x00
-    A_V1, A_V2, A_V3 = 0x01, 0x02, 0x03
-    A_FanIn, A_FanOut = 0x04, 0x05
-    A_FlowCO2, A_TotCO2 = 0x10, 0x11
-    A_FlowN2,  A_TotN2  = 0x12, 0x13
-    A_FlowBut, A_TotBut = 0x14, 0x15
-
-    def __init__(self, port: str):
+    def __init__(self, port: str, timeout: float = 8.0, settle_ms: int = 0, boot_delay: float = 2.2):
         self.logger = logging.getLogger(f"{MODULE_LOGGER_NAME}.MAXI")
         self.dev = SerialDevice(port, 115200, name="MAXI")
-        self._lock = threading.Lock()
-        self._running = True
-        self._rx = bytearray()
-        self._last_status_ts = 0.0
+        self.timeout = timeout
+        self.settle_ms = max(0, int(settle_ms))
 
-        self.status: Dict[str, Any] = {
-            "io": {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False},
-            "adc": {"P11": None, "P31": None},
-            "mfc": {
-                "co2":  {"flow": None, "total": None},
-                "n2":   {"flow": None, "total": None},
-                "butan":{"flow": None, "total": None},
-            },
-        }
+        # USB/Boot-Reset abwarten + Eingangsbuffer leeren
+        time.sleep(boot_delay)
+        t0 = time.time()
+        while time.time() - t0 < 0.25:
+            if not self.dev.read_bytes(256):
+                time.sleep(0.01)
+        self.logger.info("MAXI (sync) ready on %s", port)
 
-        threading.Thread(target=self._reader_loop, daemon=True, name="MAXI-reader").start()
-        self.request_status()
-        self._wait_for_first_status(5.0)
-        self.logger.info("MAXI started")
-
+    # ---------- Utilities ----------
     @staticmethod
     def _u26_from_float100(x: Union[int, float]) -> int:
         v = int(round(float(x) * 100.0))
-        if v < 0: v = 0
-        if v > 0x03FF_FFFF: v = 0x03FF_FFFF
-        return v
-
-    @staticmethod
-    def _le32(word: int) -> bytes:
-        return bytes([word & 0xFF, (word >> 8) & 0xFF, (word >> 16) & 0xFF, (word >> 24) & 0xFF])
+        return max(0, min(v, 0x03FF_FFFF))
 
     @staticmethod
     def _checksum_sum(data: bytes) -> int:
         return sum(data) & 0xFF
-    
-    def _wait_for_first_status(self, timeout: float = 5.0) -> bool:
-        end = time.time() + timeout
-        while time.time() < end:
-            if self._last_status_ts > 0:
-                return True
-            time.sleep(0.02)
-        return False
-
-    def _send_set(self, addr6: int, data26: int) -> None:
-        word = ((data26 & 0x03FF_FFFF) << 6) | (addr6 & 0x3F)
-        payload = self._le32(word)
-        frame = bytes([self.H0, self.H1, self.CMD_SET, self.SET_LEN]) + payload + bytes([self._checksum_sum(payload)])
-        self.logger.debug("TX SET addr=0x%02X data=%d -> %s", addr6, data26, _hexdump(frame))
-        self.dev.write_bytes(frame)
-
-    def request_status(self) -> None:
-        self.logger.info("Request status")
-        self._send_set(self.A_RequestStatus, 1)
-
-    def set_v1(self, open_: bool) -> None:    self.logger.info("set_v1(%s)", open_); self._send_set(self.A_V1,    1 if open_ else 0)
-    def set_v2(self, open_: bool) -> None:    self.logger.info("set_v2(%s)", open_); self._send_set(self.A_V2,    1 if open_ else 0)
-    def set_v3(self, open_: bool) -> None:    self.logger.info("set_v3(%s)", open_); self._send_set(self.A_V3,    1 if open_ else 0)
-    def set_fan_in(self, on: bool) -> None:   self.logger.info("set_fan_in(%s)", on); self._send_set(self.A_FanIn, 1 if on else 0)
-    def set_fan_out(self, on: bool) -> None:  self.logger.info("set_fan_out(%s)", on); self._send_set(self.A_FanOut,1 if on else 0)
-
-    def set_flow_co2(self, flow: float) -> None:   self.logger.info("set_flow_co2(%.2f)", flow); self._send_set(self.A_FlowCO2, self._u26_from_float100(flow))
-    def set_flow_n2(self, flow: float) -> None:    self.logger.info("set_flow_n2(%.2f)", flow);  self._send_set(self.A_FlowN2,  self._u26_from_float100(flow))
-    def set_flow_butan(self, flow: float) -> None: self.logger.info("set_flow_butan(%.2f)", flow); self._send_set(self.A_FlowBut, self._u26_from_float100(flow))
-
-    def set_total_co2(self, value: float = 0.0) -> None:   self.logger.info("reset_total_co2(%.2f)", value); self._send_set(self.A_TotCO2, self._u26_from_float100(value))
-    def set_total_n2(self, value: float = 0.0) -> None:    self.logger.info("reset_total_n2(%.2f)", value); self._send_set(self.A_TotN2,  self._u26_from_float100(value))
-    def set_total_butan(self, value: float = 0.0) -> None: self.logger.info("reset_total_butan(%.2f)", value); self._send_set(self.A_TotBut, self._u26_from_float100(value))
-
-    def _reader_loop(self) -> None:
-        while self._running:
-            chunk = self.dev.read_bytes(64)
-            if chunk:
-                self._rx.extend(chunk)
-                self.logger.debug("RX += %d B (hex: %s)", len(chunk), _hexdump(chunk))
-                self._drain_status_frames()
-            else:
-                time.sleep(0.002)
-        self.logger.debug("Reader loop exited")
-
-    def _find_sync(self) -> int:
-        for i in range(max(0, len(self._rx) - 1)):
-            if self._rx[i] == self.SYNC0 and self._rx[i + 1] == self.SYNC1:
-                return i
-        return -1
 
     @staticmethod
     def _le16(b: bytes, off: int) -> int:
@@ -282,39 +78,114 @@ class MAXI:
     def _le32_val(b: bytes, off: int) -> int:
         return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)
 
-    def _drain_status_frames(self) -> None:
-        while True:
-            idx = self._find_sync()
-            if idx < 0:
-                if len(self._rx) > 2048:
-                    del self._rx[:-2]
-                return
-            if idx > 0:
-                self.logger.warning("Discarding %d B before sync", idx)
-                del self._rx[:idx]
-            if len(self._rx) < 3:
-                return
-            length = self._rx[2]
-            total = 3 + length + 1
-            if len(self._rx) < total:
-                return
-            payload = bytes(self._rx[3:3 + length])
-            cs = self._rx[3 + length]
-            del self._rx[:total]
+    @staticmethod
+    def _pack_le32(word: int) -> bytes:
+        return struct.pack("<I", word & 0xFFFFFFFF)
 
-            if length not in (self.STATUS_LEN, 23):
-                self.logger.warning("Unexpected length=%d (payload=%s)", length, _hexdump(payload))
-                continue
-            if (self._checksum_sum(payload) & 0xFF) != cs:
-                self.logger.warning("Checksum mismatch: exp=%02X got=%02X payload=%s", self._checksum_sum(payload), cs, _hexdump(payload))
-                continue
+    # ---------- Low-level TX/RX ----------
+    def _tx_set_once(self, addr6: int, data26: int) -> None:
+        word = ((data26 & 0x03FF_FFFF) << 6) | (addr6 & 0x3F)
+        payload = self._pack_le32(word)
+        frame = bytes([self.H0, self.H1, self.CMD_SET, self.SET_LEN]) + payload + bytes([self._checksum_sum(payload)])
+        self.logger.debug("TX SET addr=0x%02X data=%d -> %s", addr6, data26, _hexdump(frame))
+        self.dev.write_bytes(frame)
+        # winziger Delay, damit USB/CDC garantiert sendet
+        time.sleep(0.004)
+
+    def _rx_status_once(self) -> Dict[str, Any]:
+        """
+        Liest bis timeout und extrahiert Status-Frames.
+        Wenn settle_ms > 0: nach dem ersten gültigen Frame noch 'settle_ms' weiter sammeln
+        und das *letzte* gültige Frame zurückgeben (Heartbeat-resistent).
+        """
+        t_end = time.time() + self.timeout
+        buf = bytearray()
+        raw = bytearray()
+        have_first = False
+        last_parsed = None
+        t_settle_end = 0.0
+
+        while time.time() < t_end:
+            chunk = self.dev.read_bytes(256)
+            if chunk:
+                # Rohlog für Diagnose
+                self.logger.debug("RX chunk (%d B): %s", len(chunk), _hexdump(chunk))
+                raw.extend(chunk)
+                buf.extend(chunk)
+
+                # Frames im Puffer suchen
+                i = 0
+                while i + 1 < len(buf):
+                    if buf[i] == self.SYNC0 and buf[i+1] == self.SYNC1:
+                        if i > 0:
+                            self.logger.warning("Discarding %d B before sync: %s", i, _hexdump(bytes(buf[:i])))
+                            del buf[:i]
+                            i = 0
+                            if len(buf) < 3:
+                                break
+                        if len(buf) < 3:
+                            break
+                        length = buf[2]
+                        total = 3 + length + 1
+                        if len(buf) < total:
+                            break
+                        payload = bytes(buf[3:3+length])
+                        cs = buf[3+length]
+                        del buf[:total]
+
+                        self.logger.debug("Found frame: LEN=%d, CS=0x%02X, payload=%s",
+                                          length, cs, _hexdump(payload))
+                        if length not in (self.STATUS_LEN, 25, 23):
+                            self.logger.warning("Unexpected length=%d", length)
+                            continue
+                        calc = self._checksum_sum(payload)
+                        if calc != cs:
+                            self.logger.warning("Checksum mismatch: calc=%02X got=%02X", calc, cs)
+                            continue
+
+                        # gültig → parsen
+                        last_parsed = self._parse_status(payload)
+                        self.logger.debug("Parsed status: %s", last_parsed)
+
+                        if self.settle_ms <= 0:
+                            return last_parsed
+
+                        if not have_first:
+                            have_first = True
+                            t_settle_end = time.time() + (self.settle_ms / 1000.0)
+                        continue
+                    i += 1
+
+            else:
+                if have_first and time.time() >= t_settle_end:
+                    # Sammelfenster vorbei → letztes gültiges Frame zurückgeben
+                    return last_parsed if last_parsed is not None else self._parse_status(bytes([0]*self.STATUS_LEN))
+                time.sleep(0.002)
+
+        # Timeout:
+        if last_parsed is not None:
+            return last_parsed
+        if raw:
+            self.logger.error("Timeout. Raw RX during wait (%d B): %s", len(raw), _hexdump(bytes(raw)))
+        else:
+            self.logger.error("Timeout. No data received at all.")
+        raise TimeoutError("No status frame within timeout")
+
+    def _txrx_set(self, addr6: int, data26: int, retries: int = 2) -> Dict[str, Any]:
+        last_exc = None
+        for k in range(retries + 1):
             try:
-                self._apply_status_payload(payload)
+                self._tx_set_once(addr6, data26)
+                return self._rx_status_once()
             except Exception as e:
-                self.logger.exception("apply_status_payload failed: %s", e)
-                continue
+                last_exc = e
+                self.logger.warning("TX/RX try %d/%d failed: %s", k+1, retries+1, e)
+                time.sleep(0.05)
+        assert last_exc is not None
+        raise last_exc
 
-    def _apply_status_payload(self, p: bytes) -> None:
+    # ---------- Parsing ----------
+    def _parse_status(self, p: bytes) -> Dict[str, Any]:
         flags = p[0]
         P11 = self._le16(p, 1)
         P31 = self._le16(p, 3)
@@ -324,38 +195,107 @@ class MAXI:
         totN2   = self._le32_val(p, 13) / 100.0
         flowBut = self._le16(p, 17) / 100.0
         totBut  = self._le32_val(p, 19) / 100.0
+        spCO2 = self._le16(p, 23) / 100.0 if len(p) >= 29 else None
+        spN2  = self._le16(p, 25) / 100.0 if len(p) >= 29 else None
+        spBut = self._le16(p, 27) / 100.0 if len(p) >= 29 else None
+        return {
+             "io": {
+                 "GasLeak": bool(flags & (1 << 0)),
+                 "V1":      bool(flags & (1 << 1)),
+                 "V2":      bool(flags & (1 << 2)),
+                 "V3":      bool(flags & (1 << 3)),
+                 "FanIn":   bool(flags & (1 << 4)),
+                 "FanOut":  bool(flags & (1 << 5)),
+             },
+             "adc": {"P11": P11, "P31": P31},
+             "mfc": {
+                "co2":   {"flow": flowCO2, "total": totCO2, "setpoint": spCO2},
+                "n2":    {"flow": flowN2,  "total": totN2,  "setpoint": spN2},
+                "butan": {"flow": flowBut, "total": totBut, "setpoint": spBut},
+             }
+         }
 
-        with self._lock:
-            self.status["io"]["GasLeak"] = bool(flags & (1 << 0))
-            self.status["io"]["V1"]      = bool(flags & (1 << 1))
-            self.status["io"]["V2"]      = bool(flags & (1 << 2))
-            self.status["io"]["V3"]      = bool(flags & (1 << 3))
-            self.status["io"]["FanIn"]   = bool(flags & (1 << 4))
-            self.status["io"]["FanOut"]  = bool(flags & (1 << 5))
-
-            self.status["adc"]["P11"] = P11
-            self.status["adc"]["P31"] = P31
-
-            self.status["mfc"]["co2"]["flow"]    = flowCO2
-            self.status["mfc"]["co2"]["total"]   = totCO2
-            self.status["mfc"]["n2"]["flow"]     = flowN2
-            self.status["mfc"]["n2"]["total"]    = totN2
-            self.status["mfc"]["butan"]["flow"]  = flowBut
-            self.status["mfc"]["butan"]["total"] = totBut
-
-            self._last_status_ts = time.time()
-        self.logger.debug("Status: IO=%s ADC=%s CO2(%.2f/%.2f) N2(%.2f/%.2f) BUT(%.2f/%.2f)",
-                          self.status["io"], self.status["adc"],
-                          flowCO2, totCO2, flowN2, totN2, flowBut, totBut)
-
+    # ---------- Öffentliche API ----------
     def get_status(self) -> Dict[str, Any]:
-        with self._lock:
-            out = {"ts": self._last_status_ts, **self.status}
-        self.logger.debug("get_status -> ts=%.3f", self._last_status_ts)
-        return out
+        return self._txrx_set(self.A_RequestStatus, 1)
 
-    def stop(self) -> None:
-        self._running = False
-        time.sleep(0.05)
+    def set_v1(self, open_: bool) -> Dict[str, Any]:
+        return self._txrx_set(self.A_V1, 1 if open_ else 0)
+
+    def set_v2(self, open_: bool) -> Dict[str, Any]:
+        return self._txrx_set(self.A_V2, 1 if open_ else 0)
+
+    def set_v3(self, open_: bool) -> Dict[str, Any]:
+        return self._txrx_set(self.A_V3, 1 if open_ else 0)
+
+    def set_fan_in(self, on: bool) -> Dict[str, Any]:
+        return self._txrx_set(self.A_FanIn, 1 if on else 0)
+
+    def set_fan_out(self, on: bool) -> Dict[str, Any]:
+        return self._txrx_set(self.A_FanOut, 1 if on else 0)
+
+    def set_flow_co2(self, flow: float) -> Dict[str, Any]:
+        return self._txrx_set(self.A_FlowCO2, self._u26_from_float100(flow))
+
+    def set_flow_n2(self, flow: float) -> Dict[str, Any]:
+        return self._txrx_set(self.A_FlowN2, self._u26_from_float100(flow))
+
+    def set_flow_butan(self, flow: float) -> Dict[str, Any]:
+        return self._txrx_set(self.A_FlowBut, self._u26_from_float100(flow))
+
+    def set_total_co2(self, value: float = 0.0) -> Dict[str, Any]:
+        return self._txrx_set(self.A_TotCO2, self._u26_from_float100(value))
+
+    def set_total_n2(self, value: float = 0.0) -> Dict[str, Any]:
+        return self._txrx_set(self.A_TotN2,  self._u26_from_float100(value))
+
+    def set_total_butan(self, value: float = 0.0) -> Dict[str, Any]:
+        return self._txrx_set(self.A_TotBut, self._u26_from_float100(value))
+
+    def close(self) -> None:
         self.dev.close()
-        self.logger.info("Stopped")
+
+
+# ----------------------- CLI / Test -----------------------
+
+def _demo_sequence(mx: MAXI) -> None:
+    print("Frage Status ab ...")
+    print(mx.get_status())
+
+    print("\nV1 = OPEN ...")
+    print(mx.set_v1(True))
+
+    print("\nV1 = CLOSE ...")
+    print(mx.set_v1(False))
+
+    print("\nCO2 Flow = 5.0 sccm ...")
+    print(mx.set_flow_co2(5.0))
+
+    print("\nNochmals Status ...")
+    print(mx.get_status())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MAXI Treiber – synchrones Testtool")
+    parser.add_argument("--port", default="/dev/tty.usbmodem1133201", help="Serieller Port (z.B. /dev/tty.usbmodemXXXXXXXX)")
+    parser.add_argument("--timeout", type=float, default=8.0, help="RX Timeout in Sekunden")
+    parser.add_argument("--settle", type=int, default=0, help="Sammelfenster in ms (0 zum Deaktivieren)")
+    parser.add_argument("--log", default="DEBUG", help="Loglevel (DEBUG/INFO/WARN/ERROR)")
+    args = parser.parse_args()
+
+    level = getattr(logging, args.log.upper(), logging.DEBUG)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    try:
+        mx = MAXI(args.port, timeout=args.timeout, settle_ms=args.settle)
+        _demo_sequence(mx)
+    except Exception as e:
+        print(f"Fehler: {e}")
+    finally:
+        try:
+            mx.close()
+        except Exception:
+            pass
