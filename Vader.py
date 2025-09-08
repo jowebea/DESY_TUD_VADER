@@ -128,7 +128,8 @@ class Vader(Device):
     def write_setpoint_flow_Butan_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["butan"]["setpoint"] = v  # sofort sichtbar
-        self._async(self.driver.set_flow_butan, v)           # non-blocking Geräteaufruf
+        self.driver.set_flows(butan=v, verify=True, timeout_s=1.0, tol=0.05)
+
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_CO2_nl_per_min(self) -> float:
@@ -137,7 +138,7 @@ class Vader(Device):
     def write_setpoint_flow_CO2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["co2"]["setpoint"] = v
-        self._async(self.driver.set_flow_co2, v)
+        self.driver.set_flows(co2=v, verify=True, timeout_s=1.0, tol=0.05)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_N2_nl_per_min(self) -> float:
@@ -146,7 +147,7 @@ class Vader(Device):
     def write_setpoint_flow_N2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.cache_maxi["mfc"]["n2"]["setpoint"] = v
-        self._async(self.driver.set_flow_n2, v)
+        self.driver.set_flows(n2=v, verify=True, timeout_s=1.0, tol=0.05)
 
     # --------- Ist-Flows (READ ONLY) ---------
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
@@ -274,9 +275,7 @@ class Vader(Device):
             self.driver.set_fans(False)
 
             # Alle Gas-Setpoints auf 0
-            self.driver.set_flow_butan(0.0)
-            self.driver.set_flow_co2(0.0)
-            self.driver.set_flow_n2(0.0)
+            self.driver.set_flows(n2=0, co2=0, butan=0, verify=True, timeout_s=1.0, tol=0.05)
 
             # Druck-Setpoint auf 0
             self.driver.setpoint_pressure(0.0)
