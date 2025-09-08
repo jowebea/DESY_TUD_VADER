@@ -220,34 +220,32 @@ class _MockSerialRegistry:
 class SerialDevice:
     """
     Dünne Serial-Wrapper-Klasse mit Lock.
-    Unterstützt Bytes IO + Line IO. Nutzt mock:// Endpunkte bei Bedarf.
+    Unterstützt Bytes IO + Line IO.
     """
     def __init__(self, port: str, baudrate: int = 115200, name: str = ""):
         self.name = name or "SERIAL"
         self.logger = logging.getLogger(f"{MODULE_LOGGER_NAME}.SerialDevice.{self.name}")
         self._lock = threading.Lock()
-        self._mock: Optional[_MockEndpoint] = None
+        self._mock = None  # type: Optional[_MockEndpoint]
         self._timeout = 0.1
+        self._serial = None  # wird nur gesetzt, wenn kein mock://
 
-        # Achtung: Hier bleibt das Verhalten wie im Original (erst serial.Serial()).
-        # Für echte Ports benötigt pyserial.
-        self._serial = serial.Serial(port, baudrate, timeout=self._timeout) if serial else None
-        try:
-            if self._serial:
-                self._serial.setDTR(True)
-                self._serial.setRTS(True)
-        except Exception:
-            pass
-
+        # WICHTIG: mock:// zuerst behandeln – kein pyserial.open() davor!
         if port.startswith("mock://"):
             self.logger.info("Using mock endpoint for %s @ %s", self.name, port)
             self._mock = _MockSerialRegistry.get().attach(port)
-            self._serial = None
-        else:
-            if serial is None:
-                raise RuntimeError("pyserial nicht verfügbar und kein 'mock://'-Port angegeben.")
-            self.logger.info("Opening real serial for %s: port=%s baud=%d", self.name, port, baudrate)
-            self._serial = serial.Serial(port, baudrate, timeout=self._timeout)
+            return
+
+        # Reale serielle Schnittstelle
+        if serial is None:
+            raise RuntimeError("pyserial nicht verfügbar und kein 'mock://'-Port angegeben.")
+        self.logger.info("Opening real serial for %s: port=%s baud=%d", self.name, port, baudrate)
+        self._serial = serial.Serial(port, baudrate, timeout=self._timeout)
+        try:
+            self._serial.setDTR(True)
+            self._serial.setRTS(True)
+        except Exception:
+            pass
 
     # --- Byte-IO ---
     def write_bytes(self, data: bytes) -> None:

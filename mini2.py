@@ -155,9 +155,9 @@ class _Mini2Emu(_BaseEmu):
 
 class MINI2:
     """
-    MINI2 – Binärprotokoll (32-Bit Words, Big-Endian) – unverändert (API) mit Logging.
+    MINI2 – Binärprotokoll (32-Bit Words, Big-Endian) – mit robustem Bring-up und Shutdown.
     """
-    def __init__(self, port: str, base_addr: int = 0x05):
+    def __init__(self, port: str, base_addr: int = 0x05, boot_delay: float = 1.8):
         self.logger = logging.getLogger(f"{MODULE_LOGGER_NAME}.MINI2")
         self.dev = SerialDevice(port, 115200, name="MINI2")
         self.base = int(base_addr) & 0x3F
@@ -169,11 +169,22 @@ class MINI2:
         self._rx_buf = bytearray()
         self._running = True
         self.logger.info("MINI2 started (base=0x%02X)", self.base)
-        threading.Thread(target=self._reader_loop, daemon=True, name="MINI2-reader").start()
+
+        # --- Robust wie MAXI: Boot-Reset abwarten & Eingangsbuffer leeren ---
+        time.sleep(boot_delay)
+        t0 = time.time()
+        while time.time() - t0 < 0.25:
+            junk = self.dev.read_bytes(512)
+            if not junk:
+                time.sleep(0.01)
+
+        self._reader_thr = threading.Thread(target=self._reader_loop, daemon=True, name="MINI2-reader")
+        self._reader_thr.start()
 
         self.request_status()
-        self._wait_for_recent_status(0.5)
+        self._wait_for_recent_status(0.8)
 
+    # ---------- Word helpers ----------
     @staticmethod
     def _make_word(addr6: int, payload26: int) -> int:
         return ((addr6 & 0x3F) << 26) | (payload26 & 0x03FF_FFFF)
@@ -186,12 +197,16 @@ class MINI2:
     def _be_bytes_to_u32(b: bytes) -> int:
         return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
 
+    # ---------- TX ----------
     def _send_word(self, addr: int, payload: int) -> None:
         word = self._make_word(addr, payload)
         b = self._u32_to_be_bytes(word)
         self.logger.debug("TX word addr=0x%02X payload=0x%06X -> %s", addr & 0x3F, payload & 0x03FF_FFFF, _hexdump(b))
         self.dev.write_bytes(b)
+        # winziger Delay, damit USB/CDC garantiert sendet
+        time.sleep(0.003)
 
+    # ---------- API ----------
     def request_status(self) -> None:
         self.logger.info("Request status")
         self._send_word(self.base + 6, 0x1)
@@ -230,9 +245,16 @@ class MINI2:
         self.logger.info("Set ramp: speed=%.2f kPa/s end=%.1f kPa (raw_speed=%d raw_end=%d)", speed_kpa_s, end_kpa, raw_speed, raw_end)
         self._send_word(self.base + 5, payload)
 
+    # ---------- RX ----------
     def _reader_loop(self) -> None:
         while self._running:
-            chunk = self.dev.read_bytes(64)
+            try:
+                chunk = self.dev.read_bytes(64)
+            except Exception as e:
+                # Typisch beim gleichzeitigen close(): 'Bad file descriptor'
+                self.logger.debug("reader_loop terminating due to read exception: %s", e)
+                break
+
             if chunk:
                 self._rx_buf.extend(chunk)
                 self.logger.debug("RX += %d B (hex: %s)", len(chunk), _hexdump(chunk))
@@ -276,16 +298,17 @@ class MINI2:
                 self.status["pwm2"] = vp2
         self.logger.debug("Status updated: %s", {k:self.status.get(k) for k in ("p20_kpa","p21_kpa","mode","pwm1","pwm2")})
 
-    def is_recent(self, max_age_s: float = 0.5) -> bool:
+    # ---------- Utils ----------
+    def is_recent(self, max_age_s: float = 0.6) -> bool:
         with self._lock:
             ok = (time.time() - self._last_status_time) <= max_age_s
         self.logger.debug("is_recent(%.2f) -> %s", max_age_s, ok)
         return ok
 
-    def _wait_for_recent_status(self, timeout: float = 0.5) -> bool:
+    def _wait_for_recent_status(self, timeout: float = 0.8) -> bool:
         end = time.time() + timeout
         while time.time() < end:
-            if self.is_recent(0.3):
+            if self.is_recent(0.5):
                 self.logger.debug("Recent status available")
                 return True
             time.sleep(0.01)
@@ -306,8 +329,15 @@ class MINI2:
         self.logger.debug("get_status -> %s", {k:out.get(k) for k in ("pressure_kpa","mode","pwm1","pwm2")})
         return out
 
+    # ---------- Shutdown ----------
     def stop(self) -> None:
         self._running = False
-        time.sleep(0.05)
-        self.dev.close()
-        self.logger.info("Stopped")
+        try:
+            if hasattr(self, "_reader_thr") and self._reader_thr.is_alive():
+                self._reader_thr.join(timeout=0.5)
+        except Exception:
+            pass
+        try:
+            self.dev.close()
+        finally:
+            self.logger.info("Stopped")

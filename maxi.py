@@ -33,7 +33,7 @@ class MAXI:
     """
     # Status-Frame
     SYNC0, SYNC1 = 0xAA, 0x55
-    STATUS_LEN = 29
+    STATUS_LEN = 25  # 25 oder 29 je nach FW – Parser ist tolerant
 
     # SET-Frame
     H0, H1, CMD_SET, SET_LEN = 0xA5, 0x5A, 0x01, 0x04
@@ -135,7 +135,7 @@ class MAXI:
 
                         self.logger.debug("Found frame: LEN=%d, CS=0x%02X, payload=%s",
                                           length, cs, _hexdump(payload))
-                        if length not in (self.STATUS_LEN, 25, 23):
+                        if length not in (self.STATUS_LEN, 23, 29):
                             self.logger.warning("Unexpected length=%d", length)
                             continue
                         calc = self._checksum_sum(payload)
@@ -186,39 +186,76 @@ class MAXI:
 
     # ---------- Parsing ----------
     def _parse_status(self, p: bytes) -> Dict[str, Any]:
+        """
+        Standardlayout (25..29 bytes). Unterstützt optionale Setpoint-Felder,
+        falls die Firmware sie mitsendet. (Deine Logs zeigen Setpoints.)
+        """
         flags = p[0]
         P11 = self._le16(p, 1)
         P31 = self._le16(p, 3)
+
         flowCO2 = self._le16(p, 5) / 100.0
         totCO2  = self._le32_val(p, 7) / 100.0
+
         flowN2  = self._le16(p, 11) / 100.0
         totN2   = self._le32_val(p, 13) / 100.0
+
         flowBut = self._le16(p, 17) / 100.0
         totBut  = self._le32_val(p, 19) / 100.0
-        spCO2 = self._le16(p, 23) / 100.0 if len(p) >= 29 else None
-        spN2  = self._le16(p, 25) / 100.0 if len(p) >= 29 else None
-        spBut = self._le16(p, 27) / 100.0 if len(p) >= 29 else None
+
+        # Optionale Setpoints am Ende (je 2 Bytes, 0.01 Auflösung) – defensiv prüfen
+        sp_co2 = sp_n2 = sp_but = None
+        # Bekannte Varianten: 25 (ohne), 29 (mit 2 Bytes? + padding), ggf. 31 (mit 3×U16)
+        # Wir lesen, was da ist, in Reihenfolge: CO2, N2, Butan
+        try:
+            # Rest ab Offset 23
+            off = 23
+            remain = len(p) - off
+            if remain >= 2:
+                sp_co2 = self._le16(p, off) / 100.0
+                off += 2; remain -= 2
+            if remain >= 2:
+                sp_n2 = self._le16(p, off) / 100.0
+                off += 2; remain -= 2
+            if remain >= 2:
+                sp_but = self._le16(p, off) / 100.0
+        except Exception:
+            pass
+
         return {
-             "io": {
-                 "GasLeak": bool(flags & (1 << 0)),
-                 "V1":      bool(flags & (1 << 1)),
-                 "V2":      bool(flags & (1 << 2)),
-                 "V3":      bool(flags & (1 << 3)),
-                 "FanIn":   bool(flags & (1 << 4)),
-                 "FanOut":  bool(flags & (1 << 5)),
-             },
-             "adc": {"P11": P11, "P31": P31},
-             "mfc": {
-                "co2":   {"flow": flowCO2, "total": totCO2, "setpoint": spCO2},
-                "n2":    {"flow": flowN2,  "total": totN2,  "setpoint": spN2},
-                "butan": {"flow": flowBut, "total": totBut, "setpoint": spBut},
-             }
-         }
+            "io": {
+                "GasLeak": bool(flags & (1 << 0)),
+                "V1":      bool(flags & (1 << 1)),
+                "V2":      bool(flags & (1 << 2)),
+                "V3":      bool(flags & (1 << 3)),
+                "FanIn":   bool(flags & (1 << 4)),
+                "FanOut":  bool(flags & (1 << 5)),
+            },
+            "adc": {"P11": P11, "P31": P31},
+            "mfc": {
+                "co2":   {"flow": flowCO2, "total": totCO2, "setpoint": sp_co2},
+                "n2":    {"flow": flowN2,  "total": totN2,  "setpoint": sp_n2},
+                "butan": {"flow": flowBut, "total": totBut, "setpoint": sp_but},
+            }
+        }
 
     # ---------- Öffentliche API ----------
     def get_status(self) -> Dict[str, Any]:
         return self._txrx_set(self.A_RequestStatus, 1)
 
+    # --- High-Level Shims (für VaderDeviceDriver) ---------------------------
+    def request_status(self) -> None:
+        """Nicht-blockierende Status-Anfrage: sendet nur das Request-Frame."""
+        try:
+            self._tx_set_once(self.A_RequestStatus, 1)
+        except Exception as e:
+            self.logger.warning("request_status() TX failed: %s", e)
+
+    def stop(self) -> None:
+        """Alias für close() – vom High-Level-Driver erwartet."""
+        self.close()
+
+    # Standard-API
     def set_v1(self, open_: bool) -> Dict[str, Any]:
         return self._txrx_set(self.A_V1, 1 if open_ else 0)
 

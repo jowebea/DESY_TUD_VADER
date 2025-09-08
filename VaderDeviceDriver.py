@@ -221,9 +221,9 @@ if __name__ == "__main__":
     _log.info("Starte Demo mit realen Ports (unten auskommentiert auch mock)")
     # with VaderDeviceDriver("mock://mini1", "mock://mini2", "mock://maxi") as drv:
     with VaderDeviceDriver(
-        "/dev/tty.usbmodem1133101",
-        "mock://mini2",  # "/dev/tty.usbmodem1133301",
-        "/dev/tty.usbmodem1133201"
+        "/dev/ttyACM0",
+        "/dev/ttyACM2",
+        "/dev/ttyACM1"
     ) as drv:
         _log.info("Starte Mock…")
         time.sleep(3)
