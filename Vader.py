@@ -207,7 +207,6 @@ class Vader(Device):
         return float("nan") if p is None else float(p)
 
     # ============ Diagnose-Attribute & -Kommandos ============
-    @attribute(dtype=str)
     def maxi_status_log(self) -> str:
         try:
             entries = list(self._maxi_log)[-200:]
