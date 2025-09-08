@@ -11,6 +11,12 @@ from typing import Optional, Dict, Any, List
 # === pyTango ===
 from tango import DevState, AttrWriteType, DevLong, AttrDataFormat
 from tango.server import Device, attribute, command, run, device_property
+try:
+    from tango.server import pipe
+    from tango import PipeWriteType
+    _HAS_PIPES = True
+except Exception:
+    _HAS_PIPES = False
 
 # === Treiber ===
 from VaderDeviceDriver import VaderDeviceDriver
@@ -93,6 +99,7 @@ class Vader(Device):
     mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
     mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
     maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
+    mini1_pipe_default_points = device_property(dtype=int, default_value=10000)
 
     # Logging/Diagnose-Einstellungen für MAXI
     maxi_log_every_s = device_property(dtype=float, default_value=2.0)
@@ -260,7 +267,68 @@ class Vader(Device):
     def pressure_kPa(self) -> float:
         p = self.cache_mini1.get("pressure")
         return float("nan") if p is None else float(p)
+    if _HAS_PIPES:
+        @pipe(access=PipeWriteType.READ)
+        def mini1_pressure_series(self):
+            """
+            Liefert die jüngste MINI1-Druckserie als Pipe-Payload.
+            Keys:
+            - timestamps_iso: Liste ISO8601 Strings
+            - pressure_kpa:   Liste floats
+            - count:          Anzahl Punkte
+            Hinweis: Anzahl Punkte per Geräteeigenschaft mini1_pipe_default_points (Default 1000).
+            """
+            # Hole die letzten N Stichproben aus dem Treiber (deque[Tuple[datetime, float]])
+            n = int(getattr(self, "mini1_pipe_default_points", 1000))
+            try:
+                series = self.driver.mini1_get_last_n(n) or []
+            except Exception:
+                series = []
 
+            ts = []
+            pv = []
+            for dt, p in series:
+                try:
+                    ts.append(dt.isoformat())
+                    pv.append(float(p))
+                except Exception:
+                    # robust gegenüber fehlerhaften Einträgen
+                    continue
+
+            return {
+                "timestamps_iso": ts,
+                "pressure_kpa": pv,
+                "count": len(pv),
+            }
+    else:
+        @command(dtype_in=int, dtype_out=str)
+        def GetMini1SeriesJSON(self, n: int) -> str:
+            """
+            Fallback, falls Pipes im Client/Server nicht unterstützt werden.
+            Gibt die letzten n Punkte als JSON-String zurück.
+            """
+            try:
+                series = self.driver.mini1_get_last_n(int(max(0, n))) or []
+            except Exception:
+                series = []
+            out = {
+                "timestamps_iso": [],
+                "pressure_kpa": [],
+                "count": 0,
+            }
+            for dt, p in series:
+                try:
+                    out["timestamps_iso"].append(dt.isoformat())
+                    out["pressure_kpa"].append(float(p))
+                except Exception:
+                    pass
+            out["count"] = len(out["pressure_kpa"])
+            try:
+                return json.dumps(out, ensure_ascii=False)
+            except Exception:
+                # als Minimal-Fallback eine sehr einfache Darstellung
+                return json.dumps({"count": out["count"]})
+            
     # ============ Diagnose-Kommandos ============
     @command(dtype_in=str, dtype_out=str)
     def ExportMaxiLog(self, path: str) -> str:
