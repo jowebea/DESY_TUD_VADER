@@ -74,6 +74,14 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
             if pwm is None:
                 raise ValueError(f"Step {i} {t}: PWM missing")
             program.append({"type": t, "PWM": int(pwm)})
+        
+        elif t == "eject_high_pressure_volume":
+            val = _get_first(raw, "value", "state", "open", default=None)
+            if isinstance(val, str):
+                val = val.strip().lower() in ("1", "true", "yes", "on")
+            if val is None:
+                raise ValueError(f"Step {i} eject_high_pressure_volume: value missing")
+            program.append({"type": "eject_high_pressure_volume", "value": bool(val)})
 
         else:
             raise ValueError(f"Unbekannter Step-Typ an Position {i}: {t}")
@@ -491,6 +499,11 @@ class Vader(Device):
                     self.driver.set_manual_PWM_out(pwm)
                     self.cache_mini2["pwm2"] = pwm
 
+                elif t == "eject_high_pressure_volume":
+                    v = bool(step["value"])
+                    self.set_status(f"[{idx}/{n}] eject_high_pressure_volume: {'OPEN' if v else 'CLOSE'}")
+                    self.driver.set_v3(v)
+                    self.cache_maxi["io"]["V3"] = v
                 else:
                     self.set_status(f"[{idx}/{n}] Unbekannter Typ: {t} – übersprungen")
 
