@@ -12,8 +12,7 @@ from typing import Dict, Any, List, Optional
 
 import click
 
-from vader_device_driver import VaderDeviceDriver  # ggf. Pfad/Modulname anpassen
-
+from VaderDeviceDriver import VaderDeviceDriver  
 
 # ---------------------------------------
 # Zeit-Helfer
