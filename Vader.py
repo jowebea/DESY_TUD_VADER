@@ -90,14 +90,14 @@ class Vader(Device):
         self.cache_maxi["ts"] = time.time()
 
     # Einheitlicher Pfad für MFC-Setpoints mit Echo-Bestätigung:
-    # Erwartung: Treibermethoden geben den *übernommenen* Wert zurück (Echo OK).
+    # Erwartung: Treibermethoden geben den *übernommenen* Wert zurück (Echo OK, float).
     def _set_mfc_setpoint(self, gas: str, value: float, setter_fn) -> None:
         v = max(0.0, float(value))
         try:
-            confirmed = setter_fn(v)            # ← muss vom Treiber den bestätigten Wert liefern
+            confirmed = setter_fn(v)            # ← Treiber liefert bestätigten Wert
             confirmed = float(confirmed)
             self.cache_maxi["mfc"][gas]["setpoint"] = confirmed
-            # frischen Status holen (optional) und Cache für IO/ADC mergen
+            # Status refresh (optional) für IO/ADC
             try:
                 status = self.driver.maxi_get_status()
                 if isinstance(status, dict):
@@ -106,7 +106,7 @@ class Vader(Device):
             except Exception:
                 pass
         except Exception:
-            # Keine Änderung im Cache, falls Setzen fehlschlägt
+            # Keine Cache-Änderung bei Fehler
             pass
 
     # ============ Attribute ============
@@ -206,16 +206,10 @@ class Vader(Device):
         p = self.cache_mini1.get("pressure")
         return float("nan") if p is None else float(p)
 
-    # ============ Diagnose-Attribute & -Kommandos ============
-    def maxi_status_log(self) -> str:
-        try:
-            entries = list(self._maxi_log)[-200:]
-            return json.dumps(entries, ensure_ascii=False)
-        except Exception:
-            return "[]"
-
+    # ============ Diagnose-Kommandos ============
     @command(dtype_in=str, dtype_out=str)
     def ExportMaxiLog(self, path: str) -> str:
+        """Schreibt den gesamten Ringpuffer als JSONL-Datei (eine Zeile pro Snapshot)."""
         try:
             n = 0
             with open(path, "w", encoding="utf-8") as f:
