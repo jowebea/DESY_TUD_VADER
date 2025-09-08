@@ -16,26 +16,67 @@ from tango.server import Device, attribute, command, run, device_property
 from VaderDeviceDriver import VaderDeviceDriver
 
 
+# ---------------- Helpers ----------------
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
+
+
+def _get_first(d: dict, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
 # ---------------- JSON-Programm lesen ----------------
 def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
     with open(filename, "r", encoding="utf-8") as f:
         data = json.load(f)
-    program = []
-    for i, step in enumerate(data):
-        t = step.get("type")
+    program: List[Dict[str, Any]] = []
+
+    for i, raw in enumerate(data):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Step {i}: kein Objekt")
+
+        t = raw.get("type")
         if t == "Normal":
-            program.append({"type": "Normal", "target_pressure": int(step["target_pressure"])})
-        elif t == "Ramp":
-            program.append({
-                "type": "Ramp",
-                "start_pressure": int(step["start_pressure"]),
-                "end_pressure":   int(step["end_pressure"]),
-                "ramp_speed":     float(step["ramp_speed"]),
-            })
+            target = _get_first(raw, "target_pressure_kPa", "target_pressure", default=None)
+            if target is None:
+                raise ValueError(f"Step {i} Normal: target missing")
+            program.append({"type": "Normal", "target_pressure_kPa": float(target)})
+
         elif t == "delay":
-            program.append({"type": "delay", "delay_time": int(step["delay_time"])})
+            ms = _get_first(raw, "delay_time_ms", "delay_time", default=None)
+            if ms is None:
+                raise ValueError(f"Step {i} delay: delay_time_ms missing")
+            program.append({"type": "delay", "delay_time_ms": int(ms)})
+
+        elif t == "Ramp":
+            start = _get_first(raw, "start_pressure_kPa", "start_pressure", default=None)
+            end   = _get_first(raw, "end_pressure_kPa", "end_pressure", default=None)
+            speed = _get_first(raw, "ramp_speed_kPa_sec", "ramp_speed_kP_sec", "ramp_speed", default=None)
+            if end is None or speed is None:
+                raise ValueError(f"Step {i} Ramp: end or speed missing")
+            step = {"type": "Ramp",
+                    "start_pressure_kPa": None if start is None else float(start),
+                    "end_pressure_kPa": float(end),
+                    "ramp_speed_kPa_sec": float(speed)}
+            program.append(step)
+
+        elif t in ("set_butan", "set_co2", "set_n2"):
+            flow = raw.get("flow_nl_min")
+            if flow is None:
+                raise ValueError(f"Step {i} {t}: flow_nl_min missing")
+            program.append({"type": t, "flow_nl_min": float(flow)})
+
+        elif t in ("open_vp1", "open_vp2"):
+            pwm = raw.get("PWM")
+            if pwm is None:
+                raise ValueError(f"Step {i} {t}: PWM missing")
+            program.append({"type": t, "PWM": int(pwm)})
+
         else:
-            raise ValueError(f"Unbekannter Step-Typ in JSON an Position {i}: {t}")
+            raise ValueError(f"Unbekannter Step-Typ an Position {i}: {t}")
     return program
 
 
@@ -90,12 +131,12 @@ class Vader(Device):
         self.cache_maxi["ts"] = time.time()
 
     # Einheitlicher Pfad für MFC-Setpoints mit Echo-Bestätigung:
-    # Erwartung: Treibermethoden geben den *übernommenen* Wert zurück (Echo OK, float).
+    # Treibermethoden geben den *übernommenen* Wert zurück (Echo OK, float).
     def _set_mfc_setpoint(self, gas: str, value: float, setter_fn) -> None:
-        v = max(0.0, float(value))
+        v = _clamp(value, 0.0, 10.0)  # Limit 0..10
         try:
             confirmed = setter_fn(v)            # ← Treiber liefert bestätigten Wert
-            confirmed = float(confirmed)
+            confirmed = _clamp(float(confirmed), 0.0, 10.0)
             self.cache_maxi["mfc"][gas]["setpoint"] = confirmed
             # Status refresh (optional) für IO/ADC
             try:
@@ -148,22 +189,25 @@ class Vader(Device):
     def GasLeak(self) -> bool:
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
-    # --------- Setpoint-Flows (READ/WRITE, Wert = bestätigter Echo-Wert) ---------
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
+    # --------- Setpoint-Flows (READ/WRITE, 0..10.00, Wert = bestätigter Echo-Wert) ---------
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0.0, max_value=10.0)
     def setpoint_flow_Butan_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_Butan_nl_per_min(self, value: float):
         self._set_mfc_setpoint("butan", value, self.driver.set_flow_butan)
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0.0, max_value=10.0)
     def setpoint_flow_CO2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_CO2_nl_per_min(self, value: float):
         self._set_mfc_setpoint("co2", value, self.driver.set_flow_co2)
 
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0.0, max_value=10.0)
     def setpoint_flow_N2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("setpoint") or 0.0)
 
@@ -171,32 +215,35 @@ class Vader(Device):
         self._set_mfc_setpoint("n2", value, self.driver.set_flow_n2)
 
     # MINI2 / Druck / PWM
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
+    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0.0, max_value=1000.0)
     def setpoint_pressure_kPa(self) -> float:
         return float(self.cache_mini2.get("setpoint_kpa") or 0.0)
 
     def write_setpoint_pressure_kPa(self, value: float):
-        v = max(0.0, float(value))
+        v = _clamp(value, 0.0, 1000.0)
         self.driver.setpoint_pressure(v)
         self.cache_mini2["setpoint_kpa"] = v
 
     # vp1 → valve_increase_pressure
-    @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
+    @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0, max_value=255)
     def valve_increase_pressure(self) -> int:
         return int(self.cache_mini2.get("pwm1") or 0)
 
     def write_valve_increase_pressure(self, value: int):
-        v = max(0, min(255, int(value)))
+        v = int(_clamp(int(value), 0, 255))
         self.driver.set_manual_PWM_in(v)
         self.cache_mini2["pwm1"] = v
 
     # vp2 → valve_reduce_pressure
-    @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
+    @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR,
+               min_value=0, max_value=255)
     def valve_reduce_pressure(self) -> int:
         return int(self.cache_mini2.get("pwm2") or 0)
 
     def write_valve_reduce_pressure(self, value: int):
-        v = max(0, min(255, int(value)))
+        v = int(_clamp(int(value), 0, 255))
         self.driver.set_manual_PWM_out(v)
         self.cache_mini2["pwm2"] = v
 
@@ -265,7 +312,7 @@ class Vader(Device):
             maxi_port=self.maxi_port
         )
 
-        # Caches (nur noch Setpoints, keine Flows/Totals):
+        # Caches (nur Setpoints):
         self.cache_maxi: Dict[str, Any] = {
             "io": {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False},
             "mfc": {
@@ -385,35 +432,64 @@ class Vader(Device):
                 return
             try:
                 t = step["type"]
+
                 if t == "Normal":
-                    target = max(0.0, float(step["target_pressure"]))
+                    target = _clamp(step["target_pressure_kPa"], 0.0, 1000.0)
                     self.set_status(f"[{idx}/{n}] Normal: setpoint → {target:.3f} kPa")
                     self.driver.setpoint_pressure(target)
                     self.cache_mini2["setpoint_kpa"] = target
 
                 elif t == "Ramp":
-                    start_p = max(0.0, float(step["start_pressure"]))
-                    end_p   = max(0.0, float(step["end_pressure"]))
-                    speed   = max(0.0, float(step["ramp_speed"]))  # kPa/s
+                    # start optional → wenn None, vom aktuellen Setpoint ausgehen
+                    start_p = step.get("start_pressure_kPa")
+                    if start_p is None:
+                        start_p = float(self.cache_mini2.get("setpoint_kpa") or 0.0)
+                    start_p = _clamp(start_p, 0.0, 1000.0)
+                    end_p   = _clamp(step["end_pressure_kPa"], 0.0, 1000.0)
+                    speed   = max(0.0, float(step["ramp_speed_kPa_sec"]))
                     self.set_status(f"[{idx}/{n}] Ramp: {start_p:.3f} → {end_p:.3f} kPa @ {speed:.3f} kPa/s")
                     self.driver.setpoint_pressure(start_p)
                     time.sleep(0.2)
                     self.driver.set_ramp(speed_kpa_s=speed, end_kpa=end_p)
                     approx = (abs(end_p - start_p) / max(1e-6, speed)) if speed > 0 else 0.0
                     t_end = time.time() + min(approx, 3600)
-                    while time.time() < t_end:
-                        if self._program_stop_evt.is_set():
-                            break
+                    while time.time() < t_end and not self._program_stop_evt.is_set():
                         time.sleep(0.1)
+                    self.cache_mini2["setpoint_kpa"] = end_p  # Ziel gesetzt
 
                 elif t == "delay":
-                    ms = int(step["delay_time"])
+                    ms = int(step["delay_time_ms"])
                     self.set_status(f"[{idx}/{n}] Delay: {ms} ms")
                     t_end = time.time() + ms / 1000.0
-                    while time.time() < t_end:
-                        if self._program_stop_evt.is_set():
-                            break
+                    while time.time() < t_end and not self._program_stop_evt.is_set():
                         time.sleep(0.05)
+
+                elif t == "set_butan":
+                    q = _clamp(step["flow_nl_min"], 0.0, 10.0)
+                    self.set_status(f"[{idx}/{n}] set_butan: {q:.3f} NL/min")
+                    self._set_mfc_setpoint("butan", q, self.driver.set_flow_butan)
+
+                elif t == "set_co2":
+                    q = _clamp(step["flow_nl_min"], 0.0, 10.0)
+                    self.set_status(f"[{idx}/{n}] set_co2: {q:.3f} NL/min")
+                    self._set_mfc_setpoint("co2", q, self.driver.set_flow_co2)
+
+                elif t == "set_n2":
+                    q = _clamp(step["flow_nl_min"], 0.0, 10.0)
+                    self.set_status(f"[{idx}/{n}] set_n2: {q:.3f} NL/min")
+                    self._set_mfc_setpoint("n2", q, self.driver.set_flow_n2)
+
+                elif t == "open_vp1":
+                    pwm = int(_clamp(int(step["PWM"]), 0, 255))
+                    self.set_status(f"[{idx}/{n}] open_vp1: PWM={pwm}")
+                    self.driver.set_manual_PWM_in(pwm)
+                    self.cache_mini2["pwm1"] = pwm
+
+                elif t == "open_vp2":
+                    pwm = int(_clamp(int(step["PWM"]), 0, 255))
+                    self.set_status(f"[{idx}/{n}] open_vp2: PWM={pwm}")
+                    self.driver.set_manual_PWM_out(pwm)
+                    self.cache_mini2["pwm2"] = pwm
 
                 else:
                     self.set_status(f"[{idx}/{n}] Unbekannter Typ: {t} – übersprungen")
