@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from tango import DevState, AttrWriteType, DevLong, AttrDataFormat
 from tango.server import Device, attribute, command, run, device_property
 
-# === Treiber (ANPASSEN!) ===
+# === Treiber ===
 from VaderDeviceDriver import VaderDeviceDriver
 
 
@@ -39,9 +39,10 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
 
 class Vader(Device):
     # ============ Geräteeigenschaften ============
-    mini1_port = device_property(dtype=str, default_value="mock://mini1")
-    mini2_port = device_property(dtype=str, default_value="mock://mini2")
-    maxi_port  = device_property(dtype=str, default_value="mock://maxi")
+    # KEIN mock:// mehr – reale Standard-Ports (bei Bedarf in den Geräteeigenschaften anpassen)
+    mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
+    mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
+    maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
 
     # ============ Attribute ============
     # Storage = (V1 && V2)
@@ -198,6 +199,7 @@ class Vader(Device):
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
 
+        # -> nutzt direkt die Ports aus den Geräteeigenschaften (keine mock://-URIs mehr)
         self.driver = VaderDeviceDriver(
             mini1_port=self.mini1_port,
             mini2_port=self.mini2_port,
