@@ -39,49 +39,45 @@ def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
 
 class Vader(Device):
     # ============ Geräteeigenschaften ============
-    # KEIN mock:// mehr – reale Standard-Ports (bei Bedarf in den Geräteeigenschaften anpassen)
     mini1_port = device_property(dtype=str, default_value="/dev/ttyACM0")
     mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
     maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
 
     # ============ Attribute ============
-    # Storage = (V1 && V2)
+    # large_high_pressure_volume = (V1 && V2)
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
-    def Storage(self) -> bool:
+    def large_high_pressure_volume(self) -> bool:
         return bool(self.cache_maxi["io"].get("V1")) and bool(self.cache_maxi["io"].get("V2"))
-    def write_Storage(self, value: bool):
-        self.driver.set_v1(bool(value))
-        self.driver.set_v2(bool(value))
-        self.cache_maxi["io"]["V1"] = bool(value)
-        self.cache_maxi["io"]["V2"] = bool(value)
 
-    # Einzelventile
-    @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
-    def V1(self) -> bool: return bool(self.cache_maxi["io"].get("V1"))
-    def write_V1(self, value: bool):
-        self.driver.set_v1(bool(value))
-        self.cache_maxi["io"]["V1"] = bool(value)
+    def write_large_high_pressure_volume(self, value: bool):
+        v = bool(value)
+        # V1 und V2 werden „versteckt“ gesteuert
+        self.driver.set_v1(v)
+        self.driver.set_v2(v)
+        self.cache_maxi["io"]["V1"] = v
+        self.cache_maxi["io"]["V2"] = v
 
+    # Einzelventile V1/V2: **entfernt als Attribute** (intern weiterhin genutzt)
+    # V3 bleibt als einzelnes Attribut
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
-    def V2(self) -> bool: return bool(self.cache_maxi["io"].get("V2"))
-    def write_V2(self, value: bool):
-        self.driver.set_v2(bool(value))
-        self.cache_maxi["io"]["V2"] = bool(value)
+    def V3(self) -> bool:
+        return bool(self.cache_maxi["io"].get("V3", False))
 
-    @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
-    def V3(self) -> bool: return bool(self.cache_maxi["io"].get("V3", False))
     def write_V3(self, value: bool):
-        self.driver.set_v3(bool(value))
-        self.cache_maxi["io"]["V3"] = bool(value)
+        v = bool(value)
+        self.driver.set_v3(v)
+        self.cache_maxi["io"]["V3"] = v
 
     # Fans (beide gemeinsam)
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
     def Fans(self) -> bool:
         return bool(self.cache_maxi["io"].get("FanIn")) and bool(self.cache_maxi["io"].get("FanOut"))
+
     def write_Fans(self, value: bool):
-        self.driver.set_fans(bool(value))
-        self.cache_maxi["io"]["FanIn"]  = bool(value)
-        self.cache_maxi["io"]["FanOut"] = bool(value)
+        v = bool(value)
+        self.driver.set_fans(v)
+        self.cache_maxi["io"]["FanIn"]  = v
+        self.cache_maxi["io"]["FanOut"] = v
 
     # Gas Leak (nur Anzeige)
     @attribute(dtype=bool)
@@ -89,67 +85,78 @@ class Vader(Device):
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
     # --------- Setpoint-Flows (READ/WRITE, nur positiv) ---------
+    # WICHTIG: liest/schreibt jetzt *separate* Setpoint-Felder (kein Ist-Flow mehr).
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def setpoint_flowButan(self) -> float:
-        return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
-    def write_setpoint_flowButan(self, value: float):
+    def setpoint_flow_Butan_nl_per_min(self) -> float:
+        return float(self.cache_maxi["mfc"]["butan"].get("setpoint") or 0.0)
+
+    def write_setpoint_flow_Butan_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_flow_butan(v)
+        self.cache_maxi["mfc"]["butan"]["setpoint"] = v
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def setpoint_flowCO2(self) -> float:
-        return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
-    def write_setpoint_flowCO2(self, value: float):
+    def setpoint_flow_CO2_nl_per_min(self) -> float:
+        return float(self.cache_maxi["mfc"]["co2"].get("setpoint") or 0.0)
+
+    def write_setpoint_flow_CO2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_flow_co2(v)
+        self.cache_maxi["mfc"]["co2"]["setpoint"] = v
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def setpoint_flowN2(self) -> float:
-        return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
-    def write_setpoint_flowN2(self, value: float):
+    def setpoint_flow_N2_nl_per_min(self) -> float:
+        return float(self.cache_maxi["mfc"]["n2"].get("setpoint") or 0.0)
+
+    def write_setpoint_flow_N2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_flow_n2(v)
+        self.cache_maxi["mfc"]["n2"]["setpoint"] = v
 
     # --------- Ist-Flows (READ ONLY) ---------
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flowButan(self) -> float:
+    def flow_Butan_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
 
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flowCO2(self) -> float:
+    def flow_CO2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
 
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flowN2(self) -> float:
+    def flow_N2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
 
     # Totals (READ/WRITE, nur positiv)
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def TotalCO2(self) -> float:
+    def total_flow_CO2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("total") or 0.0)
-    def write_TotalCO2(self, value: float):
+
+    def write_total_flow_CO2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_total_co2(v)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def TotalN2(self) -> float:
+    def total_flow_N2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("total") or 0.0)
-    def write_TotalN2(self, value: float):
+
+    def write_total_flow_N2_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_total_n2(v)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def TotalButan(self) -> float:
+    def total_flow_Butan_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("total") or 0.0)
-    def write_TotalButan(self, value: float):
+
+    def write_total_flow_Butan_nl_per_min(self, value: float):
         v = max(0.0, float(value))
         self.driver.set_total_butan(v)
 
     # MINI2 / Druck / PWM
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def setPoint_pressure(self) -> float:
+    def setpoint_pressure_kPa(self) -> float:
         return float(self.cache_mini2.get("setpoint_kpa") or 0.0)
-    def write_setPoint_pressure(self, value: float):
+
+    def write_setpoint_pressure_kPa(self, value: float):
         v = max(0.0, float(value))
         self.driver.setpoint_pressure(v)
         self.cache_mini2["setpoint_kpa"] = v
@@ -157,6 +164,7 @@ class Vader(Device):
     @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
     def vp1(self) -> int:
         return int(self.cache_mini2.get("pwm1") or 0)
+
     def write_vp1(self, value: int):
         v = max(0, min(255, int(value)))
         self.driver.set_manual_PWM_in(v)
@@ -165,6 +173,7 @@ class Vader(Device):
     @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
     def vp2(self) -> int:
         return int(self.cache_mini2.get("pwm2") or 0)
+
     def write_vp2(self, value: int):
         v = max(0, min(255, int(value)))
         self.driver.set_manual_PWM_out(v)
@@ -172,7 +181,7 @@ class Vader(Device):
 
     # Aktueller Druck aus MINI1 (READ ONLY)
     @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def pressure(self) -> float:
+    def pressure_kPa(self) -> float:
         p = self.cache_mini1.get("pressure")
         return float("nan") if p is None else float(p)
 
@@ -199,18 +208,20 @@ class Vader(Device):
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
 
-        # -> nutzt direkt die Ports aus den Geräteeigenschaften (keine mock://-URIs mehr)
         self.driver = VaderDeviceDriver(
             mini1_port=self.mini1_port,
             mini2_port=self.mini2_port,
             maxi_port=self.maxi_port
         )
 
+        # Caches: jetzt mit *eigenen* Setpoint-Feldern
         self.cache_maxi: Dict[str, Any] = {
             "io": {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False},
-            "mfc": {"butan": {"flow": 0.0, "total": 0.0},
-                    "co2":   {"flow": 0.0, "total": 0.0},
-                    "n2":    {"flow": 0.0, "total": 0.0}},
+            "mfc": {
+                "butan": {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
+                "co2":   {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
+                "n2":    {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
+            },
             "adc": {"P11": None, "P31": None},
             "ts": 0.0,
         }
@@ -219,6 +230,24 @@ class Vader(Device):
             "mode": "UNKNOWN", "p20_kpa": None, "p21_kpa": None, "ts": 0.0
         }
         self.cache_mini1: Dict[str, Any] = {"pressure": None, "ts": 0.0}
+
+        # Hardware-Startzustand: V1/V2/V3 False, Setpoints = 0
+        try:
+            self.driver.set_v1(False)
+            self.driver.set_v2(False)
+            self.driver.set_v3(False)
+            self.driver.set_fans(False)
+
+            # Alle Gas-Setpoints auf 0
+            self.driver.set_flow_butan(0.0)
+            self.driver.set_flow_co2(0.0)
+            self.driver.set_flow_n2(0.0)
+
+            # Druck-Setpoint auf 0
+            self.driver.setpoint_pressure(0.0)
+        except Exception:
+            # Hardware ggf. nicht erreichbar – Cache bleibt auf Default
+            pass
 
         self._program_thread: Optional[threading.Thread] = None
         self._program_stop_evt = threading.Event()
@@ -277,15 +306,19 @@ class Vader(Device):
             try:
                 self.driver.maxi_request_status()
                 status = self.driver.maxi_get_status()
+
                 io = status.get("io") or {}
                 for k in ("V1", "V2", "FanIn", "FanOut", "GasLeak"):
                     if k in io:
                         self.cache_maxi["io"][k] = bool(io[k])
+
+                # Nur *Ist*-Werte übernehmen, Setpoints nicht überschreiben!
                 mfc = status.get("mfc") or {}
                 for gas in ("butan", "co2", "n2"):
                     mg = mfc.get(gas) or {}
                     self.cache_maxi["mfc"][gas]["flow"]  = float(mg.get("flow") or 0.0)
                     self.cache_maxi["mfc"][gas]["total"] = float(mg.get("total") or 0.0)
+
                 adc = status.get("adc") or {}
                 self.cache_maxi["adc"]["P11"] = adc.get("P11")
                 self.cache_maxi["adc"]["P31"] = adc.get("P31")
