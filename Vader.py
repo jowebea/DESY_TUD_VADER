@@ -15,52 +15,6 @@ from tango.server import Device, attribute, command, run, device_property
 # === Treiber ===
 from VaderDeviceDriver import VaderDeviceDriver
 
-# ===== Helpers for robust MAXI parsing =====
-def _coerce_float(v, default=0.0):
-    try:
-        if v is None:
-            return float(default)
-        if isinstance(v, (int, float)):
-            return float(v)
-        # strings like "0.7", "0,7"
-        s = str(v).strip().replace(",", ".")
-        return float(s)
-    except Exception:
-        return float(default)
-
-_GAS_ALIASES = {
-    "butan": ("butan", "but", "butane", "c4", "c4h10"),
-    "co2":   ("co2", "CO2", "carbon_dioxide"),
-    "n2":    ("n2", "N2", "nitrogen"),
-}
-
-_MFC_KEYS = {
-    "flow": ("flow", "q", "q_nl_min", "flow_nl_min", "flow_sccm"),
-    "total": ("total", "sum", "integral", "accum"),
-    "setpoint": ("setpoint", "sp", "target", "set"),
-}
-
-def _extract_mfc_gas_block(mfc_dict: dict, gas: str) -> dict:
-    """Return the most plausible sub-dict for a gas, considering aliases."""
-    if not isinstance(mfc_dict, dict):
-        return {}
-    # Exact
-    if gas in mfc_dict and isinstance(mfc_dict[gas], dict):
-        return mfc_dict[gas]
-    # Aliases
-    for alias in _GAS_ALIASES.get(gas, (gas,)):
-        block = mfc_dict.get(alias)
-        if isinstance(block, dict):
-            return block
-    # Fallback empty
-    return {}
-
-def _get_first_key(d: dict, keys: tuple):
-    for k in keys:
-        if k in d:
-            return k
-    return None
-
 
 # ---------------- JSON-Programm lesen ----------------
 def read_program_from_json(filename: str) -> List[Dict[str, Any]]:
@@ -96,121 +50,64 @@ class Vader(Device):
     maxi_log_to_file = device_property(dtype=bool, default_value=False)
     maxi_log_file    = device_property(dtype=str, default_value="/tmp/vader_maxi_status.jsonl")
 
-    # ============ Hilfsroutinen für MAXI-Kommunikation ============
-    def _update_maxi_cache_from_status(self, status: Dict[str, Any]) -> None:
-        """Nur Ist-Werte und IO-Flags in den Cache übernehmen, Setpoints nicht überschreiben.
-        Robuste Extraktion mit Gas-/Feld-Aliases.
-        """
-        if not isinstance(status, dict):
-            return
-        # IO (inkl. V3 falls vorhanden)
+    # ============ Kleine Helfer ============
+    def _log_maxi_status(self, status: Dict[str, Any]) -> None:
+        if not hasattr(self, "_maxi_log"):
+            self._maxi_log = deque(maxlen=2000)
+            self._last_maxi_log_ts = 0.0
+        snap = {
+            "ts": time.time(),
+            "io": {
+                "V1": bool((status.get("io") or {}).get("V1", False)),
+                "V2": bool((status.get("io") or {}).get("V2", False)),
+                "V3": bool((status.get("io") or {}).get("V3", False)),
+                "FanIn":  bool((status.get("io") or {}).get("FanIn", False)),
+                "FanOut": bool((status.get("io") or {}).get("FanOut", False)),
+                "GasLeak": bool((status.get("io") or {}).get("GasLeak", False)),
+            },
+            "adc": {
+                "P11": (status.get("adc") or {}).get("P11"),
+                "P31": (status.get("adc") or {}).get("P31"),
+            },
+        }
+        self._maxi_log.append(snap)
+        now = snap["ts"]
+        if (now - getattr(self, "_last_maxi_log_ts", 0.0)) >= float(getattr(self, "maxi_log_every_s", 2.0)):
+            try:
+                self.logger.info("MAXI status %s", json.dumps({"ts": snap["ts"], "io": snap["io"]}, ensure_ascii=False))
+            except Exception:
+                pass
+            self._last_maxi_log_ts = now
+
+    def _apply_io_cache(self, status: Dict[str, Any]) -> None:
         io = status.get("io") or {}
         for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
             if k in io:
                 self.cache_maxi["io"][k] = bool(io[k])
-
-        # MFC-Werte extrahieren
-        mfc = status.get("mfc") or {}
-        for gas in ("butan", "co2", "n2"):
-            block = _extract_mfc_gas_block(mfc, gas)
-            if not block:
-                continue
-            # Flow
-            flow_key = _get_first_key(block, _MFC_KEYS["flow"])
-            if flow_key:
-                self.cache_maxi["mfc"][gas]["flow"] = _coerce_float(block.get(flow_key), 0.0)
-            # Total
-            total_key = _get_first_key(block, _MFC_KEYS["total"])
-            if total_key:
-                self.cache_maxi["mfc"][gas]["total"] = _coerce_float(block.get(total_key), 0.0)
-            # Optional: wenn Firmware Setpoint mitsendet, nur internen Diagnose-Cache updaten, NICHT Attribute-Setpoints
-            # (Attribut-Setpoints bleiben vom Client gesteuert)
-
         adc = status.get("adc") or {}
         self.cache_maxi["adc"]["P11"] = adc.get("P11")
         self.cache_maxi["adc"]["P31"] = adc.get("P31")
         self.cache_maxi["ts"] = time.time()
 
-    def _async(self, fn, *args, **kwargs) -> None:
-        """Feuer-und-vergiss: führt MAXI-Kommandos im Hintergrund aus und aktualisiert danach den Cache."""
-        def worker():
-            try:
-                fn(*args, **kwargs)  # z.B. driver.set_flow_co2(v)
-                status = self.driver.maxi_get_status()  # frischen Status holen (Roundtrip)
-                self._update_maxi_cache_from_status(status)
-                self._log_maxi_status(status)
-            except Exception:
-                # Absichtlich still – Tango-Schreibaufruf soll nicht blockieren/fehlschlagen
-                pass
-        threading.Thread(target=worker, daemon=True).start()
-
-    # ============ Hilfsroutinen: MAXI-Snapshot & Logging ============
-    def _build_maxi_snapshot(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        snap: Dict[str, Any] = {"ts": time.time(), "io": {}, "mfc": {}, "adc": {}}
+    # Einheitlicher Pfad für MFC-Setpoints mit Echo-Bestätigung:
+    # Erwartung: Treibermethoden geben den *übernommenen* Wert zurück (Echo OK).
+    def _set_mfc_setpoint(self, gas: str, value: float, setter_fn) -> None:
+        v = max(0.0, float(value))
         try:
-            io = (status or {}).get("io") or {}
-            for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
-                if k in io:
-                    snap["io"][k] = bool(io[k])
-            mfc = (status or {}).get("mfc") or {}
-            for gas in ("butan", "co2", "n2"):
-                block = _extract_mfc_gas_block(mfc, gas)
-                g: Dict[str, Any] = {}
-                fk = _get_first_key(block, _MFC_KEYS["flow"]) if block else None
-                if fk is not None:
-                    g["flow"] = _coerce_float(block.get(fk), 0.0)
-                tk = _get_first_key(block, _MFC_KEYS["total"]) if block else None
-                if tk is not None:
-                    g["total"] = _coerce_float(block.get(tk), 0.0)
-                sk = _get_first_key(block, _MFC_KEYS["setpoint"]) if block else None
-                if sk is not None:
-                    try:
-                        g["setpoint"] = float(block.get(sk)) if block.get(sk) is not None else None
-                    except Exception:
-                        g["setpoint"] = None
-                snap["mfc"][gas] = g
-            adc = (status or {}).get("adc") or {}
-            for k in ("P11", "P31"):
-                if k in adc:
-                    snap["adc"][k] = adc[k]
+            confirmed = setter_fn(v)            # ← muss vom Treiber den bestätigten Wert liefern
+            confirmed = float(confirmed)
+            self.cache_maxi["mfc"][gas]["setpoint"] = confirmed
+            # frischen Status holen (optional) und Cache für IO/ADC mergen
+            try:
+                status = self.driver.maxi_get_status()
+                if isinstance(status, dict):
+                    self._apply_io_cache(status)
+                    self._log_maxi_status(status)
+            except Exception:
+                pass
         except Exception:
+            # Keine Änderung im Cache, falls Setzen fehlschlägt
             pass
-        return snap
-
-    def _log_maxi_status(self, status: Dict[str, Any]) -> None:
-        # Ringpuffer anlegen, falls noch nicht vorhanden
-        if not hasattr(self, "_maxi_log"):
-            self._maxi_log = deque(maxlen=2000)
-            self._last_maxi_log_ts = 0.0
-            self._last_maxi_snapshot = None
-        snap = self._build_maxi_snapshot(status)
-        self._maxi_log.append(snap)
-        now = snap.get("ts", time.time())
-        interval = float(getattr(self, "maxi_log_every_s", 2.0))
-        # Änderungserkennung auf MFC/IO
-        changed = False
-        try:
-            prev = getattr(self, "_last_maxi_snapshot", None)
-            if prev is None:
-                changed = True
-            else:
-                changed = (prev.get("mfc") != snap.get("mfc")) or (prev.get("io") != snap.get("io"))
-        except Exception:
-            changed = True
-        if changed or (now - getattr(self, "_last_maxi_log_ts", 0.0)) >= interval:
-            short = {
-                "ts": snap.get("ts"),
-                "io": snap.get("io", {}),
-                "butan": snap.get("mfc", {}).get("butan", {}),
-                "co2":   snap.get("mfc", {}).get("co2", {}),
-                "n2":    snap.get("mfc", {}).get("n2", {}),
-            }
-            try:
-                self.logger.info("MAXI status %s", json.dumps(short, ensure_ascii=False))
-            except Exception:
-                pass
-            self._last_maxi_log_ts = now
-            self._last_maxi_snapshot = snap
 
     # ============ Attribute ============
     # large_high_pressure_volume = (V1 && V2)
@@ -220,19 +117,17 @@ class Vader(Device):
 
     def write_large_high_pressure_volume(self, value: bool):
         v = bool(value)
-        # V1 und V2 werden „versteckt“ gesteuert
         self.driver.set_v1(v)
         self.driver.set_v2(v)
         self.cache_maxi["io"]["V1"] = v
         self.cache_maxi["io"]["V2"] = v
 
-    # Einzelventile V1/V2: **entfernt als Attribute** (intern weiterhin genutzt)
-    # V3 bleibt als einzelnes Attribut
+    # Ehemals V3 → eject_high_pressure
     @attribute(dtype=bool, access=AttrWriteType.READ_WRITE)
-    def V3(self) -> bool:
+    def eject_high_pressure(self) -> bool:
         return bool(self.cache_maxi["io"].get("V3", False))
 
-    def write_V3(self, value: bool):
+    def write_eject_high_pressure(self, value: bool):
         v = bool(value)
         self.driver.set_v3(v)
         self.cache_maxi["io"]["V3"] = v
@@ -253,72 +148,27 @@ class Vader(Device):
     def GasLeak(self) -> bool:
         return bool(self.cache_maxi["io"].get("GasLeak", False))
 
-    # --------- Setpoint-Flows (READ/WRITE, nur positiv) ---------
-    # WICHTIG: liest/schreibt *separate* Setpoint-Felder (kein Ist-Flow mehr) und schreibt asynchron zum Gerät.
+    # --------- Setpoint-Flows (READ/WRITE, Wert = bestätigter Echo-Wert) ---------
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_Butan_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["butan"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_Butan_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.cache_maxi["mfc"]["butan"]["setpoint"] = v  # sofort sichtbar
-        self._async(self.driver.set_flow_butan, v)           # non-blocking Geräteaufruf
+        self._set_mfc_setpoint("butan", value, self.driver.set_flow_butan)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_CO2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["co2"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_CO2_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.cache_maxi["mfc"]["co2"]["setpoint"] = v
-        self._async(self.driver.set_flow_co2, v)
+        self._set_mfc_setpoint("co2", value, self.driver.set_flow_co2)
 
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
     def setpoint_flow_N2_nl_per_min(self) -> float:
         return float(self.cache_maxi["mfc"]["n2"].get("setpoint") or 0.0)
 
     def write_setpoint_flow_N2_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.cache_maxi["mfc"]["n2"]["setpoint"] = v
-        self._async(self.driver.set_flow_n2, v)
-
-    # --------- Ist-Flows (READ ONLY) ---------
-    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flow_Butan_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["butan"].get("flow") or 0.0)
-
-    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flow_CO2_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["co2"].get("flow") or 0.0)
-
-    @attribute(dtype=float, dformat=AttrDataFormat.SCALAR)
-    def flow_N2_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["n2"].get("flow") or 0.0)
-
-    # Totals (READ/WRITE, nur positiv)
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def total_flow_CO2_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["co2"].get("total") or 0.0)
-
-    def write_total_flow_CO2_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.driver.set_total_co2(v)
-
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def total_flow_N2_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["n2"].get("total") or 0.0)
-
-    def write_total_flow_N2_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.driver.set_total_n2(v)
-
-    @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
-    def total_flow_Butan_nl_per_min(self) -> float:
-        return float(self.cache_maxi["mfc"]["butan"].get("total") or 0.0)
-
-    def write_total_flow_Butan_nl_per_min(self, value: float):
-        v = max(0.0, float(value))
-        self.driver.set_total_butan(v)
+        self._set_mfc_setpoint("n2", value, self.driver.set_flow_n2)
 
     # MINI2 / Druck / PWM
     @attribute(dtype=float, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0.0)
@@ -330,20 +180,22 @@ class Vader(Device):
         self.driver.setpoint_pressure(v)
         self.cache_mini2["setpoint_kpa"] = v
 
+    # vp1 → valve_increase_pressure
     @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
-    def vp1(self) -> int:
+    def valve_increase_pressure(self) -> int:
         return int(self.cache_mini2.get("pwm1") or 0)
 
-    def write_vp1(self, value: int):
+    def write_valve_increase_pressure(self, value: int):
         v = max(0, min(255, int(value)))
         self.driver.set_manual_PWM_in(v)
         self.cache_mini2["pwm1"] = v
 
+    # vp2 → valve_reduce_pressure
     @attribute(dtype=DevLong, access=AttrWriteType.READ_WRITE, dformat=AttrDataFormat.SCALAR, min_value=0, max_value=255)
-    def vp2(self) -> int:
+    def valve_reduce_pressure(self) -> int:
         return int(self.cache_mini2.get("pwm2") or 0)
 
-    def write_vp2(self, value: int):
+    def write_valve_reduce_pressure(self, value: int):
         v = max(0, min(255, int(value)))
         self.driver.set_manual_PWM_out(v)
         self.cache_mini2["pwm2"] = v
@@ -357,7 +209,6 @@ class Vader(Device):
     # ============ Diagnose-Attribute & -Kommandos ============
     @attribute(dtype=str)
     def maxi_status_log(self) -> str:
-        """Gibt die letzten ~200 MAXI-Snapshots als JSON-Array zurück."""
         try:
             entries = list(self._maxi_log)[-200:]
             return json.dumps(entries, ensure_ascii=False)
@@ -366,7 +217,6 @@ class Vader(Device):
 
     @command(dtype_in=str, dtype_out=str)
     def ExportMaxiLog(self, path: str) -> str:
-        """Schreibt den gesamten Ringpuffer als JSONL-Datei (eine Zeile pro Snapshot)."""
         try:
             n = 0
             with open(path, "w", encoding="utf-8") as f:
@@ -400,13 +250,12 @@ class Vader(Device):
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
 
-        # --- Logging für MAXI-Status vorbereiten ---
+        # --- Logging vorbereiten ---
         self.logger = logging.getLogger("Vader.Tango")
         if not self.logger.handlers:
             self.logger.setLevel(logging.INFO)
         self._maxi_log = deque(maxlen=2000)
         self._last_maxi_log_ts = 0.0
-        self._last_maxi_snapshot = None
         if getattr(self, "maxi_log_to_file", False):
             try:
                 fh = logging.FileHandler(self.maxi_log_file)
@@ -423,13 +272,13 @@ class Vader(Device):
             maxi_port=self.maxi_port
         )
 
-        # Caches: jetzt mit *eigenen* Setpoint-Feldern
+        # Caches (nur noch Setpoints, keine Flows/Totals):
         self.cache_maxi: Dict[str, Any] = {
             "io": {"V1": False, "V2": False, "V3": False, "FanIn": False, "FanOut": False, "GasLeak": False},
             "mfc": {
-                "butan": {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
-                "co2":   {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
-                "n2":    {"setpoint": 0.0, "flow": 0.0, "total": 0.0},
+                "butan": {"setpoint": 0.0},
+                "co2":   {"setpoint": 0.0},
+                "n2":    {"setpoint": 0.0},
             },
             "adc": {"P11": None, "P31": None},
             "ts": 0.0,
@@ -440,22 +289,17 @@ class Vader(Device):
         }
         self.cache_mini1: Dict[str, Any] = {"pressure": None, "ts": 0.0}
 
-        # Hardware-Startzustand: V1/V2/V3 False, Setpoints = 0
+        # Hardware-Startzustand
         try:
             self.driver.set_v1(False)
             self.driver.set_v2(False)
             self.driver.set_v3(False)
             self.driver.set_fans(False)
-
-            # Alle Gas-Setpoints auf 0
             self.driver.set_flow_butan(0.0)
             self.driver.set_flow_co2(0.0)
             self.driver.set_flow_n2(0.0)
-
-            # Druck-Setpoint auf 0
             self.driver.setpoint_pressure(0.0)
         except Exception:
-            # Hardware ggf. nicht erreichbar – Cache bleibt auf Default
             pass
 
         self._program_thread: Optional[threading.Thread] = None
@@ -480,7 +324,6 @@ class Vader(Device):
             self.driver.close()
         except Exception:
             pass
-        # File-Handler sauber abklemmen
         try:
             if hasattr(self, "_maxi_log_file_handler"):
                 self.logger.removeHandler(self._maxi_log_file_handler)
@@ -516,7 +359,7 @@ class Vader(Device):
             time.sleep(period)
 
     def _poll_maxi(self):
-        period = 0.5  # schnellere Aktualisierung; watchdog-Style Timing
+        period = 0.5
         next_due = 0.0
         while not self._stop_evt.is_set():
             now = time.time()
@@ -524,15 +367,10 @@ class Vader(Device):
                 time.sleep(min(0.05, next_due - now))
                 continue
             try:
-                # Einige Firmwares senden zwischendurch Heartbeats ohne MFC-Block.
-                # Wir lesen im Zweifel zweimal und nehmen den ersten mit MFC-Daten.
                 status = self.driver.maxi_get_status()
-                if not isinstance(status, dict) or not status.get("mfc"):
-                    status2 = self.driver.maxi_get_status()
-                    if isinstance(status2, dict):
-                        status = status2
-                self._update_maxi_cache_from_status(status)
-                self._log_maxi_status(status)
+                if isinstance(status, dict):
+                    self._apply_io_cache(status)
+                    self._log_maxi_status(status)
             except Exception:
                 pass
             next_due = time.time() + period

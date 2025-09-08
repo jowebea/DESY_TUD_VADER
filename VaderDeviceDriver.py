@@ -151,23 +151,64 @@ class VaderDeviceDriver:
         self._mx_roundtrip(self.maxi.set_fan_out, on)
 
     # --- Flows (API unverändert: None) ---
-    def set_flow_co2(self, flow: float) -> None:
-        self.logger.info("API set_flow_co2(%.2f)", flow)
-        s = self._mx_roundtrip(self.maxi.set_flow_co2, float(flow))
-        sp = (s.get("mfc", {}).get("co2", {}) if isinstance(s, dict) else {}).get("setpoint")
-        self.logger.debug("ECHO setpoint CO2 = %s", f"{float(sp):.3f}" if sp is not None else "None")
+    def set_flow_co2(self, flow: float) -> float:
+        v = max(0.0, float(flow))
+        self.logger.info("API set_flow_co2(%.3f)", v)
+        s = self._mx_roundtrip(self.maxi.set_flow_co2, v)
+        sp = None
+        try:
+            sp = (s or {}).get("mfc", {}).get("co2", {}).get("setpoint")
+        except Exception:
+            sp = None
+        if sp is not None:
+            try:
+                c = float(sp)
+                self.logger.debug("ECHO setpoint CO2 = %.3f", c)
+                return c
+            except Exception:
+                pass
+        self.logger.warning("No setpoint echo for CO2; returning requested value: %.3f", v)
+        return v
 
-    def set_flow_n2(self, flow: float) -> None:
-        self.logger.info("API set_flow_n2(%.2f)", flow)
-        s = self._mx_roundtrip(self.maxi.set_flow_n2, float(flow))
-        sp = (s.get("mfc", {}).get("n2", {}) if isinstance(s, dict) else {}).get("setpoint")
-        self.logger.debug("ECHO setpoint N2  = %s", f"{float(sp):.3f}" if sp is not None else "None")
 
-    def set_flow_butan(self, flow: float) -> None:
-        self.logger.info("API set_flow_butan(%.2f)", flow)
-        s = self._mx_roundtrip(self.maxi.set_flow_butan, float(flow))
-        sp = (s.get("mfc", {}).get("butan", {}) if isinstance(s, dict) else {}).get("setpoint")
-        self.logger.debug("ECHO setpoint BUT = %s", f"{float(sp):.3f}" if sp is not None else "None")
+    def set_flow_n2(self, flow: float) -> float:
+        v = max(0.0, float(flow))
+        self.logger.info("API set_flow_n2(%.3f)", v)
+        s = self._mx_roundtrip(self.maxi.set_flow_n2, v)
+        sp = None
+        try:
+            sp = (s or {}).get("mfc", {}).get("n2", {}).get("setpoint")
+        except Exception:
+            sp = None
+        if sp is not None:
+            try:
+                c = float(sp)
+                self.logger.debug("ECHO setpoint N2  = %.3f", c)
+                return c
+            except Exception:
+                pass
+        self.logger.warning("No setpoint echo for N2; returning requested value: %.3f", v)
+        return v
+
+
+    def set_flow_butan(self, flow: float) -> float:
+        v = max(0.0, float(flow))
+        self.logger.info("API set_flow_butan(%.3f)", v)
+        s = self._mx_roundtrip(self.maxi.set_flow_butan, v)
+        sp = None
+        try:
+            sp = (s or {}).get("mfc", {}).get("butan", {}).get("setpoint")
+        except Exception:
+            sp = None
+        if sp is not None:
+            try:
+                c = float(sp)
+                self.logger.debug("ECHO setpoint BUT = %.3f", c)
+                return c
+            except Exception:
+                pass
+        self.logger.warning("No setpoint echo for BUT; returning requested value: %.3f", v)
+        return v
 
     # --- Totalisatoren (API unverändert) ---
     def set_total_co2(self, value: float = 0.0) -> None:
@@ -421,9 +462,12 @@ if __name__ == "__main__":
     log = logging.getLogger("VaderDeviceDriver.main")
 
     # Beispiel: reale Ports via ENV, sonst mock
-    mini1_port = os.environ.get("VADER_MINI1_PORT", "/dev/cu.usbmodem1133101")
-    mini2_port = os.environ.get("VADER_MINI2_PORT", "/dev/cu.usbmodem1133301")
-    maxi_port  = os.environ.get("VADER_MAXI_PORT",  "/dev/cu.usbmodem1133201")
+    # mini1_port = os.environ.get("VADER_MINI1_PORT", "/dev/cu.usbmodem1133101")
+    # mini2_port = os.environ.get("VADER_MINI2_PORT", "/dev/cu.usbmodem1133301")
+    # maxi_port  = os.environ.get("VADER_MAXI_PORT",  "/dev/cu.usbmodem1133201")
+    mini1_port = os.environ.get("VADER_MINI1_PORT", "/dev/ttyACM0")
+    mini2_port = os.environ.get("VADER_MAXI_PORT", "/dev/ttyACM2")
+    maxi_port  = os.environ.get("VADER_MINI2_PORT", "/dev/ttyACM1")
 
     with VaderDeviceDriver(mini1_port, mini2_port, maxi_port) as drv:
         # kleine Statusrunde
