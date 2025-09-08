@@ -9,7 +9,7 @@
   {"type": "Normal", "target_pressure_kPa": 0},
   {"type": "eject_high_pressure_volume", "value": true},
   {"type": "delay",  "delay_time_ms": 10000},
-  {"type": "eject_high_pressure_volume", "value": false}
+  {"type": "eject_high_pressure_volume", "value": false},
   {"type": "delay",  "delay_time_ms": 300},
   {"type": "set_butan",  "flow_nl_min": 5},
   {"type": "delay",  "delay_time_ms": 10000},
@@ -22,5 +22,5 @@
   {"type": "open_vp2",  "PWM": 255},
   {"type": "delay",  "delay_time_ms": 5000},
   {"type": "delay",  "delay_time_ms": 5000},
-  {"type": "delay",  "delay_time_ms": 5000},
+  {"type": "delay",  "delay_time_ms": 5000}
 ]
