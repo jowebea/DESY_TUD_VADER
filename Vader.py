@@ -4,6 +4,8 @@
 import json
 import threading
 import time
+import logging
+from collections import deque
 from typing import Optional, Dict, Any, List
 
 # === pyTango ===
@@ -89,6 +91,11 @@ class Vader(Device):
     mini2_port = device_property(dtype=str, default_value="/dev/ttyACM2")
     maxi_port  = device_property(dtype=str, default_value="/dev/ttyACM1")
 
+    # Logging/Diagnose-Einstellungen für MAXI
+    maxi_log_every_s = device_property(dtype=float, default_value=2.0)
+    maxi_log_to_file = device_property(dtype=bool, default_value=False)
+    maxi_log_file    = device_property(dtype=str, default_value="/tmp/vader_maxi_status.jsonl")
+
     # ============ Hilfsroutinen für MAXI-Kommunikation ============
     def _update_maxi_cache_from_status(self, status: Dict[str, Any]) -> None:
         """Nur Ist-Werte und IO-Flags in den Cache übernehmen, Setpoints nicht überschreiben.
@@ -131,10 +138,79 @@ class Vader(Device):
                 fn(*args, **kwargs)  # z.B. driver.set_flow_co2(v)
                 status = self.driver.maxi_get_status()  # frischen Status holen (Roundtrip)
                 self._update_maxi_cache_from_status(status)
+                self._log_maxi_status(status)
             except Exception:
                 # Absichtlich still – Tango-Schreibaufruf soll nicht blockieren/fehlschlagen
                 pass
         threading.Thread(target=worker, daemon=True).start()
+
+    # ============ Hilfsroutinen: MAXI-Snapshot & Logging ============
+    def _build_maxi_snapshot(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        snap: Dict[str, Any] = {"ts": time.time(), "io": {}, "mfc": {}, "adc": {}}
+        try:
+            io = (status or {}).get("io") or {}
+            for k in ("V1", "V2", "V3", "FanIn", "FanOut", "GasLeak"):
+                if k in io:
+                    snap["io"][k] = bool(io[k])
+            mfc = (status or {}).get("mfc") or {}
+            for gas in ("butan", "co2", "n2"):
+                block = _extract_mfc_gas_block(mfc, gas)
+                g: Dict[str, Any] = {}
+                fk = _get_first_key(block, _MFC_KEYS["flow"]) if block else None
+                if fk is not None:
+                    g["flow"] = _coerce_float(block.get(fk), 0.0)
+                tk = _get_first_key(block, _MFC_KEYS["total"]) if block else None
+                if tk is not None:
+                    g["total"] = _coerce_float(block.get(tk), 0.0)
+                sk = _get_first_key(block, _MFC_KEYS["setpoint"]) if block else None
+                if sk is not None:
+                    try:
+                        g["setpoint"] = float(block.get(sk)) if block.get(sk) is not None else None
+                    except Exception:
+                        g["setpoint"] = None
+                snap["mfc"][gas] = g
+            adc = (status or {}).get("adc") or {}
+            for k in ("P11", "P31"):
+                if k in adc:
+                    snap["adc"][k] = adc[k]
+        except Exception:
+            pass
+        return snap
+
+    def _log_maxi_status(self, status: Dict[str, Any]) -> None:
+        # Ringpuffer anlegen, falls noch nicht vorhanden
+        if not hasattr(self, "_maxi_log"):
+            self._maxi_log = deque(maxlen=2000)
+            self._last_maxi_log_ts = 0.0
+            self._last_maxi_snapshot = None
+        snap = self._build_maxi_snapshot(status)
+        self._maxi_log.append(snap)
+        now = snap.get("ts", time.time())
+        interval = float(getattr(self, "maxi_log_every_s", 2.0))
+        # Änderungserkennung auf MFC/IO
+        changed = False
+        try:
+            prev = getattr(self, "_last_maxi_snapshot", None)
+            if prev is None:
+                changed = True
+            else:
+                changed = (prev.get("mfc") != snap.get("mfc")) or (prev.get("io") != snap.get("io"))
+        except Exception:
+            changed = True
+        if changed or (now - getattr(self, "_last_maxi_log_ts", 0.0)) >= interval:
+            short = {
+                "ts": snap.get("ts"),
+                "io": snap.get("io", {}),
+                "butan": snap.get("mfc", {}).get("butan", {}),
+                "co2":   snap.get("mfc", {}).get("co2", {}),
+                "n2":    snap.get("mfc", {}).get("n2", {}),
+            }
+            try:
+                self.logger.info("MAXI status %s", json.dumps(short, ensure_ascii=False))
+            except Exception:
+                pass
+            self._last_maxi_log_ts = now
+            self._last_maxi_snapshot = snap
 
     # ============ Attribute ============
     # large_high_pressure_volume = (V1 && V2)
@@ -278,6 +354,29 @@ class Vader(Device):
         p = self.cache_mini1.get("pressure")
         return float("nan") if p is None else float(p)
 
+    # ============ Diagnose-Attribute & -Kommandos ============
+    @attribute(dtype=str)
+    def maxi_status_log(self) -> str:
+        """Gibt die letzten ~200 MAXI-Snapshots als JSON-Array zurück."""
+        try:
+            entries = list(self._maxi_log)[-200:]
+            return json.dumps(entries, ensure_ascii=False)
+        except Exception:
+            return "[]"
+
+    @command(dtype_in=str, dtype_out=str)
+    def ExportMaxiLog(self, path: str) -> str:
+        """Schreibt den gesamten Ringpuffer als JSONL-Datei (eine Zeile pro Snapshot)."""
+        try:
+            n = 0
+            with open(path, "w", encoding="utf-8") as f:
+                for item in self._maxi_log:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    n += 1
+            return f"OK: wrote {n} lines to {path}"
+        except Exception as e:
+            return f"ERROR: {e}"
+
     # ============ Programmsteuerung ============
     @command(dtype_in=str)
     def RunProgram(self, json_path: str):
@@ -300,6 +399,23 @@ class Vader(Device):
         Device.init_device(self)
         self.set_state(DevState.INIT)
         self.set_status("Initialisiere Treiber...")
+
+        # --- Logging für MAXI-Status vorbereiten ---
+        self.logger = logging.getLogger("Vader.Tango")
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
+        self._maxi_log = deque(maxlen=2000)
+        self._last_maxi_log_ts = 0.0
+        self._last_maxi_snapshot = None
+        if getattr(self, "maxi_log_to_file", False):
+            try:
+                fh = logging.FileHandler(self.maxi_log_file)
+                fh.setLevel(logging.INFO)
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+                self.logger.addHandler(fh)
+                self._maxi_log_file_handler = fh
+            except Exception:
+                pass
 
         self.driver = VaderDeviceDriver(
             mini1_port=self.mini1_port,
@@ -364,6 +480,12 @@ class Vader(Device):
             self.driver.close()
         except Exception:
             pass
+        # File-Handler sauber abklemmen
+        try:
+            if hasattr(self, "_maxi_log_file_handler"):
+                self.logger.removeHandler(self._maxi_log_file_handler)
+        except Exception:
+            pass
         self.set_state(DevState.OFF)
         self.set_status("Gestoppt.")
 
@@ -410,6 +532,7 @@ class Vader(Device):
                     if isinstance(status2, dict):
                         status = status2
                 self._update_maxi_cache_from_status(status)
+                self._log_maxi_status(status)
             except Exception:
                 pass
             next_due = time.time() + period
