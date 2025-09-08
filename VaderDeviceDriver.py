@@ -1,29 +1,78 @@
 # -*- coding: utf-8 -*-
+"""
+VaderDeviceDriver (High-Level)
+- Kapselt MINI1, MINI2, MAXI.
+- Public API beibehalten; zusätzliche Komfort- und Diagnose-Funktionen.
+- Setpoint-Setzen liefert intern ein Echo (wird geloggt und abgelegt).
+
+NEU (MAXI-Integration fix):
+- Sämtliche MAXI-Aufrufe gehen über ein serialisierendes _mx_roundtrip().
+- Mapping der Setpoint-Echos an die internen last_setpoints robuster gegenüber None.
+- request_status() bleibt nicht-blockierend; get_status() macht den vollständigen Roundtrip.
+- __main__: falscher Aufruf drv.maxi.maxi_get_status() -> korrigiert zu drv.maxi_get_status().
+"""
+
 import logging
 import time
+import threading
 from typing import Optional, Tuple, Dict, Any, List, Union
-from datetime import datetime
 
-from utilities import MODULE_LOGGER_NAME
 from mini1 import MINI1
 from mini2 import MINI2
 from maxi import MAXI
+from utilities import MODULE_LOGGER_NAME
+
 
 class VaderDeviceDriver:
     """
     High-Level-Kapselung für MINI1, MINI2 und MAXI (funktioniert mit mock:// Ports).
-    Public API unverändert.
+    Public API unverändert (alle bisherigen Methoden existieren weiterhin und behalten Rückgabewerte).
+    Ergänzungen:
+      - set_flows(n2=?, co2=?, butan=?, verify=True, timeout_s=1.0, tol=0.05)
+      - get_last_setpoints(), get_last_status()
+      - assert_setpoints(...)
     """
+
+    # -----------------------------
+    # Konstruktion / Ressourcen
+    # -----------------------------
     def __init__(self, mini1_port: str, mini2_port: str, maxi_port: str, mini1_max_samples: int = 300_000):
         self.logger = logging.getLogger(f"{MODULE_LOGGER_NAME}.VaderDeviceDriver")
+
+        # Geräte instanziieren
         self.mini1 = MINI1(mini1_port, max_samples=mini1_max_samples)
         self.mini2 = MINI2(mini2_port)
         self.maxi  = MAXI(maxi_port)
+
+        # Diagnosepuffer
+        self.last_status: Dict[str, Any] = {}
+        self.last_setpoints: Dict[str, Optional[float]] = {"n2": None, "co2": None, "butan": None}
+
+        # Lock für alle synchronen MAXI-Roundtrips (ein Befehl -> genau ein Status-Frame)
+        self._mx_lock = threading.Lock()
+
         self.logger.info("Driver ready (mini1=%s mini2=%s maxi=%s)", mini1_port, mini2_port, maxi_port)
 
-    # -----------------------------
-    # MINI2
-    # -----------------------------
+    def close(self) -> None:
+        self.logger.info("API close()")
+        # Reihenfolge: Sensoren/Regler beenden
+        try:
+            self.mini1.stop()
+        finally:
+            try:
+                self.mini2.stop()
+            finally:
+                self.maxi.stop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # =============================
+    # MINI2 (Druckcontroller)
+    # =============================
     def set_manual_PWM_in(self, value: int) -> None:
         self.logger.info("API set_manual_PWM_in(%d)", value)
         self.mini2.set_manual_vp1(value)
@@ -40,6 +89,10 @@ class VaderDeviceDriver:
         self.logger.info("API set_ramp(%.2f, %.1f)", speed_kpa_s, end_kpa)
         self.mini2.set_ramp(speed_kpa_s, end_kpa)
 
+    def setpoint_pressure(self, kpa: Union[int, float]) -> None:
+        self.logger.info("API setpoint_pressure(%.2f)", float(kpa))
+        self.mini2.set_target_pressure(kpa)
+
     def mini2_request_status(self) -> None:
         self.logger.debug("API mini2_request_status()")
         self.mini2.request_status()
@@ -49,49 +102,85 @@ class VaderDeviceDriver:
         self.logger.debug("API mini2_get_status()->pressure=%.2f", s.get("pressure_kpa", float("nan")))
         return s
 
-    # -----------------------------
-    # MAXI
-    # -----------------------------
+    # =============================
+    # MAXI (MFCs, Ventile, Lüfter)
+    # =============================
+    def _mx_roundtrip(self, fn, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Serialisiert MAXI-Aufrufe & legt Echo/Status ab.
+        Erwartet: fn(...) gibt direkt das vom MAXI geparste Status-Dict zurück.
+        """
+        with self._mx_lock:
+            status = fn(*args, **kwargs)
+
+        # Status ablegen
+        if isinstance(status, dict):
+            self.last_status = status
+
+            # Setpoint-Echos (falls von Firmware mitgesendet) ablegen
+            try:
+                mfc = status.get("mfc") or {}
+                for gas in ("n2", "co2", "butan"):
+                    sp = (mfc.get(gas) or {}).get("setpoint", None)
+                    # Nur übernehmen, wenn Setpoint-Feld tatsächlich vorhanden ist
+                    if sp is not None:
+                        self.last_setpoints[gas] = float(sp)
+            except Exception:
+                # defensive: niemals eine MAXI-Aktion wegen Diagnose blockieren
+                pass
+
+        return status
+
+    # --- Ventile & Lüfter (API unverändert) ---
     def set_v1(self, open_: bool) -> None:
         self.logger.info("API set_v1(%s)", open_)
-        self.maxi.set_v1(open_)
+        self._mx_roundtrip(self.maxi.set_v1, open_)
 
     def set_v2(self, open_: bool) -> None:
         self.logger.info("API set_v2(%s)", open_)
-        self.maxi.set_v2(open_)
+        self._mx_roundtrip(self.maxi.set_v2, open_)
 
     def set_v3(self, open_: bool) -> None:
         self.logger.info("API set_v3(%s)", open_)
-        self.maxi.set_v3(open_)
+        self._mx_roundtrip(self.maxi.set_v3, open_)
 
     def set_fans(self, on: bool) -> None:
         self.logger.info("API set_fans(%s)", on)
-        self.maxi.set_fan_in(on)
-        self.maxi.set_fan_out(on)
+        # zwei getrennte Roundtrips, bewusst sequenziell (jede Aktion -> Status)
+        self._mx_roundtrip(self.maxi.set_fan_in, on)
+        self._mx_roundtrip(self.maxi.set_fan_out, on)
 
+    # --- Flows (API unverändert: None) ---
     def set_flow_co2(self, flow: float) -> None:
         self.logger.info("API set_flow_co2(%.2f)", flow)
-        self.maxi.set_flow_co2(flow)
+        s = self._mx_roundtrip(self.maxi.set_flow_co2, float(flow))
+        sp = (s.get("mfc", {}).get("co2", {}) if isinstance(s, dict) else {}).get("setpoint")
+        self.logger.debug("ECHO setpoint CO2 = %s", f"{float(sp):.3f}" if sp is not None else "None")
 
     def set_flow_n2(self, flow: float) -> None:
         self.logger.info("API set_flow_n2(%.2f)", flow)
-        self.maxi.set_flow_n2(flow)
+        s = self._mx_roundtrip(self.maxi.set_flow_n2, float(flow))
+        sp = (s.get("mfc", {}).get("n2", {}) if isinstance(s, dict) else {}).get("setpoint")
+        self.logger.debug("ECHO setpoint N2  = %s", f"{float(sp):.3f}" if sp is not None else "None")
 
     def set_flow_butan(self, flow: float) -> None:
         self.logger.info("API set_flow_butan(%.2f)", flow)
-        self.maxi.set_flow_butan(flow)
+        s = self._mx_roundtrip(self.maxi.set_flow_butan, float(flow))
+        sp = (s.get("mfc", {}).get("butan", {}) if isinstance(s, dict) else {}).get("setpoint")
+        self.logger.debug("ECHO setpoint BUT = %s", f"{float(sp):.3f}" if sp is not None else "None")
 
+    # --- Totalisatoren (API unverändert) ---
     def set_total_co2(self, value: float = 0.0) -> None:
         self.logger.info("API set_total_co2(%.2f)", value)
-        self.maxi.set_total_co2(value)
+        self._mx_roundtrip(self.maxi.set_total_co2, float(value))
 
     def set_total_n2(self, value: float = 0.0) -> None:
         self.logger.info("API set_total_n2(%.2f)", value)
-        self.maxi.set_total_n2(value)
+        self._mx_roundtrip(self.maxi.set_total_n2, float(value))
 
     def set_total_butan(self, value: float = 0.0) -> None:
         self.logger.info("API set_total_butan(%.2f)", value)
-        self.maxi.set_total_butan(value)
+        self._mx_roundtrip(self.maxi.set_total_butan, float(value))
 
     def reset_totalisator_co2(self) -> None:
         self.logger.info("API reset_totalisator_co2()")
@@ -106,37 +195,152 @@ class VaderDeviceDriver:
         self.set_total_butan(0.0)
 
     def maxi_request_status(self) -> None:
+        """
+        Nicht-blockierende Status-Anfrage – sendet nur das Request-Frame.
+        (MAXI.request_status() kümmert sich bereits um TX-Fehlerbehandlung.)
+        """
         self.logger.debug("API maxi_request_status()")
-        self.maxi.request_status()
+        with self._mx_lock:
+            self.maxi.request_status()
 
     def maxi_get_status(self) -> Dict[str, Any]:
-        s = self.maxi.get_status()
+        """
+        Blockierender vollständiger Roundtrip:
+        sendet Request + liest genau EIN Status-Frame (Heartbeat-resistent).
+        """
         self.logger.debug("API maxi_get_status()")
-        return s
+        return self._mx_roundtrip(self.maxi.get_status)
 
-    # -----------------------------
-    # MINI1
-    # -----------------------------
+    # =============================
+    # MINI1 (Druckserie)
+    # =============================
     def mini1_get_last_n(self, n: int):
         self.logger.debug("API mini1_get_last_n(%d)", n)
         return self.mini1.get_last_n(n)
 
-    # -----------------------------
-    # bestehende Methoden
-    # -----------------------------
+    # =============================
+    # Komfort / High-Level
+    # =============================
+    def get_last_setpoints(self) -> Dict[str, Optional[float]]:
+        """Zuletzt vom Gerät (MAXI) gesehenes Setpoint-Echo pro Gas."""
+        return dict(self.last_setpoints)
+
+    def get_last_status(self) -> Dict[str, Any]:
+        """Zuletzt gesehenes MAXI-Status-Dict (von irgendeinem Roundtrip)."""
+        return dict(self.last_status) if self.last_status else {}
+
+    def assert_setpoints(self, *, n2: Optional[float] = None, co2: Optional[float] = None,
+                         butan: Optional[float] = None, tol: float = 0.05) -> bool:
+        """
+        Prüft rein das Setpoint-Echo (nicht den Flow!).
+        True, wenn alle angegebenen Gase innerhalb Toleranz liegen.
+        """
+        sp = self.get_last_setpoints()
+        ok = True
+        if n2 is not None:
+            v = sp.get("n2")
+            if v is None or abs(v - float(n2)) > tol:
+                self.logger.error("N2 Setpoint-Echo mismatch: saw=%s, want=%.3f", v, float(n2))
+                ok = False
+        if co2 is not None:
+            v = sp.get("co2")
+            if v is None or abs(v - float(co2)) > tol:
+                self.logger.error("CO2 Setpoint-Echo mismatch: saw=%s, want=%.3f", v, float(co2))
+                ok = False
+        if butan is not None:
+            v = sp.get("butan")
+            if v is None or abs(v - float(butan)) > tol:
+                self.logger.error("BUTAN Setpoint-Echo mismatch: saw=%s, want=%.3f", v, float(butan))
+                ok = False
+        return ok
+
+    def set_flows(self,
+                  n2: Optional[float] = None,
+                  co2: Optional[float] = None,
+                  butan: Optional[float] = None,
+                  *,
+                  verify: bool = True,
+                  timeout_s: float = 1.0,
+                  tol: float = 0.05) -> None:
+        """
+        Bequeme Sammel-API: setzt beliebige Kombinationen von MFC-Setpoints.
+        verify=True: wartet kurz und verifiziert per Setpoint-Echo (nicht Flow).
+
+        Rückgabewert: None (API-Kompatibilität beibehalten).
+        Erfolg/Fehler wird geloggt; letzter Status ist via get_last_status() verfügbar.
+        """
+        if n2 is not None:
+            self.set_flow_n2(float(n2))
+        if co2 is not None:
+            self.set_flow_co2(float(co2))
+        if butan is not None:
+            self.set_flow_butan(float(butan))
+
+        if not verify:
+            return
+
+        # robuster Verifikations-Loop (nur Echo, nicht Mess-Flow)
+        t_end = time.time() + max(0.05, float(timeout_s))
+        want = {
+            "n2": float(n2) if n2 is not None else None,
+            "co2": float(co2) if co2 is not None else None,
+            "butan": float(butan) if butan is not None else None,
+        }
+        while time.time() < t_end:
+            self.maxi_get_status()  # frischen Status holen (Roundtrip)
+            if self._echo_matches(want, tol):
+                self.logger.info("Setpoint-Echo OK (within ±%.3f): %s", tol, {k: v for k, v in want.items() if v is not None})
+                return
+            time.sleep(0.05)
+
+        # letzter Versuch
+        self.maxi_get_status()
+        if self._echo_matches(want, tol):
+            self.logger.info("Setpoint-Echo OK (within ±%.3f) after final read.", tol)
+            return
+
+        # nicht erfolgreich → Fehler loggen
+        current = self.get_last_setpoints()
+        mismatches: Dict[str, Dict[str, Optional[float]]] = {}
+        for k, w in want.items():
+            if w is None:
+                continue
+            v = current.get(k)
+            if v is None or abs(v - w) > tol:
+                mismatches[k] = {"want": w, "have": v}
+        self.logger.error("Setpoint-Echo NICHT erreicht: %s", mismatches)
+
+    def _echo_matches(self, want: Dict[str, Optional[float]], tol: float) -> bool:
+        sp = self.get_last_setpoints()
+        for gas, w in want.items():
+            if w is None:
+                continue
+            v = sp.get(gas)
+            if v is None or abs(v - w) > tol:
+                return False
+        return True
+
+    # =============================
+    # Bestehende High-Level-Sequenzen
+    # =============================
     def storage_volume(self, open_: bool) -> None:
         self.logger.info("API storage_volume(%s)", open_)
-        self.maxi.set_v1(open_)
-        self.maxi.set_v2(open_)
+        self._mx_roundtrip(self.maxi.set_v1, open_)
+        self._mx_roundtrip(self.maxi.set_v2, open_)
 
     def vac_all(self, vacuum_pressure_kpa: float, timeout_s: int = 120) -> None:
+        """
+        Evakuiert die Anlage bis 'vacuum_pressure_kpa' oder Timeout.
+        Setzt währenddessen alle MFC-Setpoints auf 0.
+        """
         self.logger.info("API vac_all(target=%.2f kPa, timeout=%ds)", vacuum_pressure_kpa, timeout_s)
-        self.maxi.set_flow_butan(0)
-        self.maxi.set_flow_co2(0)
-        self.maxi.set_flow_n2(0)
-        self.maxi.set_v1(True)
-        self.maxi.set_v2(True)
-        self.maxi.set_v3(True)
+        # MFCs auf 0 (mit Echo/Status)
+        self.set_flows(n2=0.0, co2=0.0, butan=0.0, verify=False)
+
+        # Ventile / Lüfter
+        self.set_v1(True)
+        self.set_v2(True)
+        self.set_v3(True)
         self.set_fans(True)
 
         start = time.time()
@@ -146,40 +350,52 @@ class VaderDeviceDriver:
                 self.logger.info("Vacuum reached: %.2f kPa <= %.2f kPa", p, vacuum_pressure_kpa)
                 break
             if time.time() - start > timeout_s:
-                self.logger.warning("Vacuum timeout after %ds (last=%.2f kPa)", timeout_s, p if p is not None else float("nan"))
+                self.logger.warning("Vacuum timeout after %ds (last=%.2f kPa)",
+                                    timeout_s, p if p is not None else float("nan"))
                 break
             time.sleep(0.5)
 
-        self.maxi.set_v1(False)
-        self.maxi.set_v2(False)
-        self.maxi.set_v3(False)
+        # zurücksetzen
+        self.set_v1(False)
+        self.set_v2(False)
+        self.set_v3(False)
         self.set_fans(False)
+        # MINI2 entlasten
         self.mini2.set_target_pressure(0)
         self.mini2.set_manual_vp1(0)
         self.mini2.set_manual_vp2(0)
 
     def use_gas(self, n2: float, co2: float, butan: float) -> None:
+        """
+        Beibehaltener Kurzweg: setzt alle drei Setpoints (ohne Verifikation).
+        """
         self.logger.info("API use_gas(n2=%.2f, co2=%.2f, but=%.2f)", n2, co2, butan)
-        self.maxi.set_flow_n2(n2)
-        self.maxi.set_flow_co2(co2)
-        self.maxi.set_flow_butan(butan)
-
-    def setpoint_pressure(self, kpa: Union[int, float]) -> None:
-        self.logger.info("API setpoint_pressure(%.2f)", float(kpa))
-        self.mini2.set_target_pressure(kpa)
+        self.set_flow_n2(n2)
+        self.set_flow_co2(co2)
+        self.set_flow_butan(butan)
 
     def get_all_status(self, mini1_last_n: Optional[int] = 100) -> Dict[str, Any]:
+        """
+        Frischt MINI2 & MAXI Status an, wartet kurz auf MINI2, liefert kombinierten Dict.
+        """
         self.logger.debug("API get_all_status(mini1_last_n=%s)", mini1_last_n)
+        # Statusanforderungen stoßen Updates an
         self.mini2.request_status()
-        self.maxi.request_status()
-        self.mini2._wait_for_recent_status(0.5)
+        self.maxi_request_status()
+        # kurze Wartezeit, damit MINI2 Status aktualisiert
+        try:
+            # falls vorhanden; sonst einfach kleine Pause
+            self.mini2._wait_for_recent_status(0.5)  # type: ignore[attr-defined]
+        except Exception:
+            time.sleep(0.1)
+
         res = {
             "mini1": {
                 "latest_pressure": self.mini1.pressure,
-                "recent_series": self.mini1.get_last_n(mini1_last_n)
+                "recent_series": self.mini1.get_last_n(mini1_last_n) if mini1_last_n else [],
             },
             "mini2": self.mini2.get_status(),
-            "maxi":  self.maxi.get_status(),
+            "maxi":  self.maxi_get_status(),
         }
         self.logger.debug("All status collected")
         return res
@@ -190,206 +406,35 @@ class VaderDeviceDriver:
         self.reset_totalisator_co2()
         self.reset_totalisator_n2()
 
-    def close(self) -> None:
-        self.logger.info("API close()")
-        self.mini1.stop()
-        self.mini2.stop()
-        self.maxi.stop()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
 
 # ============================================================
-# DEMO
-# ============================================================
-# ============================================================
-# DEMO + TESTS
+# Optionaler, knapper Demo-Einstieg (keine Tests / kein CI)
 # ============================================================
 if __name__ == "__main__":
     import os
-    level = os.environ.get("VADER_LOG_LEVEL", "INFO").upper()
+
     logging.basicConfig(
-        level=getattr(logging, level, logging.DEBUG),
-        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S"
+        level=os.environ.get("VADER_LOGLEVEL", "INFO").upper(),
+        format="%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
+        datefmt=":%H:%M:%S",
     )
-    logging.getLogger("vader.mock.SerialDevice.MAXI").setLevel(logging.INFO)
-    logging.getLogger("vader.mock.MAXI").setLevel(logging.INFO)
+    log = logging.getLogger("VaderDeviceDriver.main")
 
-    _log = logging.getLogger(MODULE_LOGGER_NAME)
+    # Beispiel: reale Ports via ENV, sonst mock
+    mini1_port = os.environ.get("VADER_MINI1_PORT", "/dev/cu.usbmodem1133101")
+    mini2_port = os.environ.get("VADER_MINI2_PORT", "/dev/cu.usbmodem1133301")
+    maxi_port  = os.environ.get("VADER_MAXI_PORT",  "/dev/cu.usbmodem1133201")
 
-    # -----------------------------
-    # Hilfsfunktionen für die Tests
-    # -----------------------------
-    # --- NEU: tiefe, robuste Suche nach numerischen Werten ---
-    from math import isfinite
-    from typing import Any, List, Tuple, Optional
+    with VaderDeviceDriver(mini1_port, mini2_port, maxi_port) as drv:
+        # kleine Statusrunde
+        s_all = drv.get_all_status(mini1_last_n=5)
+        log.info("INIT status: %s", {k: (list(v.keys()) if isinstance(v, dict) else type(v).__name__)
+                                     for k, v in s_all.items()})
 
-    def _iter_deep_items(obj: Any, path: str = "") -> List[Tuple[str, Any]]:
-        """Erzeugt (pfad, wert) für alle Blätter (auch in Listen)."""
-        out = []
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                p = f"{path}.{k}" if path else str(k)
-                out.extend(_iter_deep_items(v, p))
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                p = f"{path}[{i}]"
-                out.extend(_iter_deep_items(v, p))
-        else:
-            out.append((path, obj))
-        return out
+        # Beispiel: Setpoints setzen & verifizieren (nur Echo)
+        drv.set_flows(n2=5.0, co2=10.0, butan=0.0, verify=True, timeout_s=1.0, tol=0.05)
+        log.info("Last setpoints: %s", drv.get_last_setpoints())
 
-    def _score_flow_candidate(path_low: str, gas: str) -> int:
-        """
-        Scoring: höhere Punkte = wahrscheinlicher echter Flow.
-        Bevorzugt Pfade mit 'flow'/'sccm'/'slm' und exaktem Gasnamen,
-        meidet 'setpoint'/'target'/'total'.
-        """
-        score = 0
-        if "flow" in path_low: score += 4
-        if "sccm" in path_low or "slm" in path_low: score += 2
-        if gas in path_low: score += 3
-        # negative Hinweise
-        if "set" in path_low or "target" in path_low or "sp" in path_low: score -= 5
-        if "total" in path_low or "integral" in path_low: score -= 3
-        if "valve" in path_low or "v" in path_low and "flow" not in path_low: score -= 2
-        return score
-
-    def _find_flow_candidates(status: dict, gas: str) -> List[Tuple[str, float, int]]:
-        """
-        Liefert sortierte Kandidaten (pfad, wert, score) für einen Gas-Flow.
-        """
-        gas = gas.lower()
-        items = _iter_deep_items(status)
-        cands: List[Tuple[str, float, int]] = []
-        for path, val in items:
-            # dict-Wrapper wie {"value": x} behandeln
-            if isinstance(val, dict) and "value" in val:
-                try:
-                    val = float(val["value"])
-                except Exception:
-                    continue
-            if isinstance(val, (int, float)) and isfinite(val):
-                path_low = path.lower()
-                # nur Pfade berücksichtigen, die nach Flow aussehen
-                if any(t in path_low for t in ["flow", "sccm", "slm"]):
-                    score = _score_flow_candidate(path_low, gas)
-                    cands.append((path, float(val), score))
-        # falls nichts mit 'flow', erlauben wir fallback auf gas + numeric
-        if not cands:
-            for path, val in items:
-                if isinstance(val, (int, float)) and isfinite(val):
-                    path_low = path.lower()
-                    if gas in path_low:
-                        score = 1  # schwacher Treffer
-                        cands.append((path, float(val), score))
-        # beste oben
-        cands.sort(key=lambda x: x[2], reverse=True)
-        return cands
-
-    def _extract_flow_from_status(status: dict, gas: str, logger: logging.Logger) -> Optional[float]:
-        cands = _find_flow_candidates(status, gas)
-        if not cands:
-            logger.debug("FLOW-SUCHE: Keine Kandidaten für %s gefunden.", gas.upper())
-            return None
-        # Top-Kandidat loggen (plus ein paar weitere zur Diagnose)
-        logger.debug("FLOW-SUCHE [%s]: Top=%s (%.4f, score=%d); weitere=%s",
-                    gas.upper(), cands[0][0], cands[0][1], cands[0][2],
-                    [p for p,_,_ in cands[1:3]])
-        return cands[0][1]
-
-    # --- NEU: optionaler Fallback über Totalisator-Ableitung ---
-    def _extract_total_from_status(status: dict, gas: str, logger: logging.Logger) -> Optional[float]:
-        gas = gas.lower()
-        items = _iter_deep_items(status)
-        best = None
-        for path, val in items:
-            if isinstance(val, dict) and "value" in val:
-                try:
-                    val = float(val["value"])
-                except Exception:
-                    continue
-            if isinstance(val, (int, float)) and isfinite(val):
-                pl = path.lower()
-                if gas in pl and ("total" in pl or "integral" in pl or "sum" in pl or "totalizer" in pl):
-                    best = float(val)
-                    # keine weitere Heuristik nötig: erster Treffer reicht
-                    break
-        if best is None:
-            logger.debug("TOTAL-SUCHE: Kein Totalisator für %s gefunden.", gas.upper())
-        return best
-
-    def _wait_and_measure_flow(drv: "VaderDeviceDriver", gas: str, setpoint: float,
-                            timeout_s: float = 8.0, poll_s: float = 0.25,
-                            tol_abs_zero: float = 0.15, tol_rel: float = 0.05,
-                            use_total_fallback: bool = True) -> Optional[float]:
-        """
-        Aktualisiert Status aktiv über maxi_request_status(), sucht Flow tief rekursiv.
-        Optionaler Fallback: Flow ≈ d(Total)/dt, falls kein direkter Flow zu finden ist.
-        """
-        gas = gas.lower()
-        setter = {
-            "n2":   drv.set_flow_n2,
-            "co2":  drv.set_flow_co2,
-            "butan":drv.set_flow_butan,
-            "butane": drv.set_flow_butan,  # kleine Kulanz
-        }[gas]
-
-        _log.info("TEST: Setze %s-Setpoint auf %.3f …", gas.upper(), setpoint)
-        setter(setpoint)
-
-        t0 = time.time()
-        last_flow: Optional[float] = None
-
-        # für Total-Fallback Werte puffern
-        total_start = total_last = None
-        t_total_start = t_total_last = None
-
-        while time.time() - t0 < timeout_s:
-            # WICHTIG: erst Status anfordern, dann lesen
-            drv.maxi_request_status()
-            time.sleep(0.05)
-            s = drv.maxi_get_status()
-
-            # Primär: direkter Flow
-            val = _extract_flow_from_status(s, gas, _log)
-            if val is not None:
-                last_flow = val
-                if setpoint == 0.0:
-                    if abs(val) <= tol_abs_zero:
-                        break
-                else:
-                    tol = max(tol_abs_zero, tol_rel * max(1e-9, setpoint))
-                    if abs(val - setpoint) <= tol:
-                        break
-
-            # Sekundär: Totalisator-Ableitung als Schätzer
-            if use_total_fallback:
-                tot = _extract_total_from_status(s, gas, _log)
-                now = time.time()
-                if tot is not None:
-                    if total_start is None:
-                        total_start = tot
-                        t_total_start = now
-                    total_last = tot
-                    t_total_last = now
-
-            time.sleep(poll_s)
-
-        # Falls kein direkter Flow, versuche Ableitung ΔTotal/Δt
-        if last_flow is None and use_total_fallback and total_last is not None and t_total_start is not None:
-            dt = max(1e-6, (t_total_last - t_total_start))
-            deriv = (total_last - total_start) / dt
-            _log.warning("TEST: Kein direkter %s-Flow gefunden; nutze d(Total)/dt ≈ %.4f", gas.upper(), deriv)
-            last_flow = float(deriv)
-
-        if last_flow is None:
-            _log.error("TEST: Konnte für %s weiterhin keinen Mess-Flow bestimmen.", gas.upper())
-        else:
-            _log.info("TEST: Gemessener %s-Flow nach Setpoint=%.3f: %.3f", gas.upper(), setpoint, last_flow)
-        return last_flow
+        # KORRIGIERT: vollständigen MAXI-Status holen (kein .maxi_get_status() in MAXI)
+        s_maxi = drv.maxi_get_status()
+        log.info("MAXI status: %s", s_maxi)
